@@ -1,0 +1,20 @@
+# Locomotion (velocity tracking) task-type profile: a quadruped walks at a commanded velocity.
+# Unlike the arm tasks, goal here is a velocity-command range rather than spatial coordinates.
+# The velocity base env ships its own DR (anymal_c is marked dr: builtin in robots.yaml), so
+# there are no dr_off_overrides.
+name: Locomotion
+desc: The quadruped walks steadily at the commanded velocity (domain randomization is built in).
+train_script: soarm101/src/isaac_so_arm101/scripts/rsl_rl/train.py
+
+goal_zones:
+  speed:
+    label: Velocity command
+    axes:
+      lin_x: {path: "env.commands.base_velocity.ranges.lin_vel_x", default: [-1.0, 1.0], limits: [-2.0, 2.0], unit: "m/s", name: Forward/back}
+      lin_y: {path: "env.commands.base_velocity.ranges.lin_vel_y", default: [-1.0, 1.0], limits: [-1.5, 1.5], unit: "m/s", name: Lateral}
+      ang_z: {path: "env.commands.base_velocity.ranges.ang_vel_z", default: [-1.0, 1.0], limits: [-2.0, 2.0], unit: "rad/s", name: Turn}
+
+behavior_presets:
+  balanced: {}
+
+dr_off_overrides: {}

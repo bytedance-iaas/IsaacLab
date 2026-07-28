@@ -1,70 +1,118 @@
 # training-service
 
-A config-driven training layer for Isaac Lab. The user (or the frontend) fills in a single YAML
-request — or a form that produces one — and never touches the command line or Python.
+A config-driven training layer for Isaac Lab. The user, or the frontend on their behalf, fills in a
+single YAML request and never touches the command line or Python.
 
-**Task-agnostic**: `launcher.py` and `schema.py` are generic; each task contributes one
-`profiles/<task>.yaml`. Adding a task needs no code change.
+**Robot- and task-agnostic**: adding a robot or a task only touches `profiles/`; `schema.py` and
+`launcher.py` stay unchanged.
 
 ## Layout
 
 ```
 training-service/
-├── schema.py            # request schema + validation (common base + task-specific section)
+├── schema.py            # request schema + validation
 ├── launcher.py          # read request -> validate -> build Hydra command -> run (supports --dry-run)
-├── profiles/            # one per task: task-id mapping, tunable knobs, presets, DR switches
-│   ├── reach.yaml
-│   └── lift.yaml
-└── example_request.yaml # example request (what the frontend ultimately produces)
+├── profiles/
+│   ├── robots.yaml      # robot catalog: robot -> supported tasks (task ids) + DR capability (true/false/builtin)
+│   └── tasks/           # task-type profiles (robot-agnostic)
+│       ├── reach.yaml   #   goal_zones / behavior_presets / dr_off_overrides
+│       ├── lift.yaml
+│       └── velocity.yaml
+└── example_request.yaml # example request (what the frontend produces)
 ```
 
-## Two-layer design
+- **robots.yaml** answers "which robot can do which tasks, and does it have domain randomization".
+- **tasks/&lt;task&gt;.yaml** answers "what can be tuned for this task" — spatial ranges, behavior
+  presets, and how to neutralize DR.
+- Robots and tasks are decoupled: one reach profile serves SO-ARM, Franka and UR; only the task id
+  differs.
 
-- **Common base** (identical for every task): `model` / `task` / `training_budget`
-  (quick/standard/thorough) / `sim2real_robustness` / `record_video` / `seed` / `output_name` /
-  `behavior`
-- **Task-specific section** (described by the profile): `goal` — spatial ranges such as the reach
-  goal area, or the lift object and goal areas
+## Currently supported
+
+| Robot | Tasks | DR | Status |
+|-------|-------|----|--------|
+| SO-ARM100 / 101 | reach, lift | switchable (added by us) | ✅ training verified |
+| Franka Panda | reach, lift | none | reach verified; lift is structurally identical |
+| UR10 | reach | none | same structure as Franka reach |
+| Anymal-C | velocity (locomotion) | built in | ✅ verified |
 
 ## Usage
 
 ```bash
 # inside the image, at /workspace/isaaclab/training-service
-python launcher.py --config request.yaml            # validate and start training
-python launcher.py --config request.yaml --dry-run  # print the command only
+../isaaclab.sh -p launcher.py --config request.yaml            # validate and start training
+../isaaclab.sh -p launcher.py --config request.yaml --dry-run  # print the command only
 ```
 
-A backend can also call `launcher.build_command(request_dict)` directly, or validate first with
-`schema.validate(req)`, which raises `ValidationError` with a user-readable message.
+A backend can also call `launcher.build_command(req)` directly, or validate first with
+`schema.validate(req)`, which raises `ValidationError` carrying a user-readable message.
 
-## Knobs to Hydra overrides
+## Worked example: launching a training run
 
-Every knob resolves to a Hydra override of an existing config value, which is why new tasks need no
-code:
+Say the goal is a precise SO-ARM101 pick-and-place policy, with real-robot robustness on, at the
+standard budget.
 
-- goal ranges → `env.commands.*.ranges.*` / `env.events.reset_*.params.pose_range.*`
-- behavior preset → `env.rewards.*.weight`
-- training scale → `--num_envs` / `--max_iterations` (mapped from `training_budget`)
-- sim2real off → rewrite the DR event parameters to no-ops (see `dr_off_overrides` in each profile)
+**Step 1 — get the request YAML.** Either configure it in the console and copy the YAML, or write it
+by hand:
 
-## sim2real robustness (physics domain randomization)
+```yaml
+# my_pick.yaml
+robot: so101
+task: lift
+training_budget: standard      # quick | standard | thorough
+behavior: precise              # balanced | precise | smooth
+sim2real_robustness: true
+seed: 42
+output_name: pick_v1
+goal:
+  object_start_zone: {x: [-0.08, 0.08], y: [-0.15, 0.15]}
+  target_zone:       {x: [0.15, 0.30], y: [-0.15, 0.15], z: [0.10, 0.25]}
+```
 
-DR events are built into the soarm101 reach and lift `EventCfg` (actuator gains and joint friction;
-lift additionally randomizes object mass and friction), modeled on isaaclab
-`manipulation/deploy/reach`. They are active when `sim2real_robustness: true`; when `false`, the
-launcher neutralizes them via `dr_off_overrides`. Tasks such as locomotion ship their own DR.
+**Step 2 — start training:**
 
-## Adding a task
+```bash
+kubectl exec -it isaaclab -n default -- bash
+cd /workspace/isaaclab/training-service
+../isaaclab.sh -p launcher.py --config my_pick.yaml            # run it
+# ../isaaclab.sh -p launcher.py --config my_pick.yaml --dry-run  # inspect the command first
+```
 
-1. Confirm the task is manager-based — reward and DR tuning require it; direct tasks only support
-   the common base.
-2. Add `profiles/<task>.yaml` with `task_ids`, `goal_zones`, `behavior_presets`, and optionally
-   `dr_off_overrides`.
-3. If the task has no physics DR, add randomization events to its `EventCfg` (see `deploy/reach` or
-   the velocity tasks for reference).
+The launcher validates the request (for example, whether the object range leaves the workspace),
+looks up `robots.yaml` and `tasks/lift.yaml`, assembles the full command — task id
+`Isaac-SO-ARM101-Lift-Cube-v0`, `--num_envs 4096`,
+`env.rewards.object_goal_tracking_fine_grained.weight=10.0`, the range overrides — and runs it. **The
+user never sees a task id, a Hydra path, or a reward term name.**
+
+**Step 3 — artifacts:** checkpoints land in `logs/rsl_rl/lift/<timestamp>/model_*.pt`.
+
+### With and without training-service
+
+| | Without | With |
+|---|---|---|
+| What the user writes | a long command carrying task ids, Hydra paths and reward names | one plain-language YAML |
+| On mistakes | a wrong path silently trains the wrong thing | out-of-range values and unsupported combinations are **rejected up front** with an explanation |
+| Switching robots | edit many parameters | edit one line, `robot:` |
+
+> Note: this runs inside the pod, so training is tied to the exec session (foreground). With the API
+> in front of it, a run can be started from the browser as a background K8s Job.
+
+## DR / sim2real behavior
+
+- `dr: true` (SO-ARM) — the sim2real switch is effective; when turned off the launcher neutralizes
+  the DR terms using the task profile's `dr_off_overrides`.
+- `dr: false` (Franka, UR) — the task has no DR wired up, so the switch is ignored and no
+  `dr_off` overrides are emitted.
+- `dr: builtin` (Anymal velocity) — the task ships its own DR and it is always on.
+
+## Adding a robot or a task
+
+- **Add a robot**: another entry in `robots.yaml` (name / group / dr / tasks).
+- **Add a task type**: another profile under `tasks/` (goal_zones / behavior_presets /
+  dr_off_overrides). If the task is manager-based and needs a sim2real switch, also add
+  randomization events to its `EventCfg` — see `deploy/reach` or the velocity tasks for reference.
 
 ## Calibrating the budget tiers (TODO)
 
 The `num_envs` / `max_iterations` values in `schema.py:BUDGET_PRESETS` are estimates. They should be
-calibrated against measured wall-clock time on the target GPU so that quick/standard/thorough map to
-a duration that can be promised to users.
+calibrated against measured wall-clock time on the target GPU.

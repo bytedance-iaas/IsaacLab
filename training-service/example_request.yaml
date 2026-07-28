@@ -2,16 +2,16 @@
 # Two layers: the common base plus a task-specific section (goal).
 
 # --- Common base ---
-model: so101                 # so100 | so101 (existing URDFs)
-task: reach                  # see profiles/ for supported tasks
+robot: so101                 # see profiles/robots.yaml (so100/so101/franka/ur10/anymal_c)
+task: reach                  # a task this robot supports (see robots.yaml)
 training_budget: standard    # quick | standard | thorough
-sim2real_robustness: true    # enable physics domain randomization; helps real-robot transfer
-record_video: false          # record training video (written to logs/.../videos)
+sim2real_robustness: true    # physics domain randomization (switchable only for robots with dr: true)
+record_video: false
 seed: 42
 output_name: my_reach_v1
-behavior: balanced           # balanced | precise | smooth
+behavior: balanced           # balanced | precise | smooth (depends on the task profile)
 
-# --- Task-specific section (reach: goal area) ---
+# --- Task-specific section (reach: goal area; lift and velocity differ, see tasks/<task>.yaml) ---
 goal:
   target_zone:
     x: [-0.10, 0.10]
@@ -21,4 +21,3 @@ goal:
 # --- Advanced (optional): extra Hydra overrides, passed through verbatim ---
 advanced:
   overrides: []
-  # e.g. ["agent.algorithm.learning_rate=5e-4", "env.episode_length_s=8.0"]
