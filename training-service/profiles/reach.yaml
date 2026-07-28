@@ -1,0 +1,35 @@
+# Reach task profile: declares the client-tunable knobs, their Hydra mapping, and presets.
+# The launcher is task-agnostic: adding a task only needs another yaml like this, no code change.
+display_name: "Arm Reach"
+type: manager_based                    # reward/DR tuning is only supported for manager_based envs
+# Use soarm101's own train.py (rsl-rl 5.x compatible, registers the SO-ARM tasks)
+train_script: soarm101/src/isaac_so_arm101/scripts/rsl_rl/train.py
+
+# Robot model -> task id (existing URDFs only)
+task_ids:
+  so100: Isaac-SO-ARM100-Reach-v0
+  so101: Isaac-SO-ARM101-Reach-v0
+
+# Task-specific spatial knobs: the client supplies ranges, the launcher validates them and turns them into Hydra overrides
+goal_zones:
+  target_zone:
+    label: "Goal area (m)"
+    x: {path: "env.commands.ee_pose.ranges.pos_x", default: [-0.10, 0.10], limits: [-0.35, 0.35]}
+    y: {path: "env.commands.ee_pose.ranges.pos_y", default: [-0.25, -0.10], limits: [-0.35, 0.35]}
+    z: {path: "env.commands.ee_pose.ranges.pos_z", default: [0.10, 0.30], limits: [0.0, 0.5]}
+
+# Behavior presets -> reward weight overrides (relative to the real defaults)
+behavior_presets:
+  balanced: {}
+  precise:
+    "env.rewards.end_effector_position_tracking_fine_grained.weight": 0.2
+    "env.rewards.end_effector_orientation_tracking.weight": -0.2
+  smooth:
+    "env.rewards.action_rate.weight": -0.001
+    "env.rewards.joint_vel.weight": -0.001
+
+# Applied when sim2real_robustness=false: rewrites the DR terms to no-ops instead of relying on null overrides
+dr_off_overrides:
+  "env.events.robot_joint_stiffness_and_damping.params.stiffness_distribution_params": [1.0, 1.0]
+  "env.events.robot_joint_stiffness_and_damping.params.damping_distribution_params": [1.0, 1.0]
+  "env.events.robot_joint_friction.params.friction_distribution_params": [0.0, 0.0]

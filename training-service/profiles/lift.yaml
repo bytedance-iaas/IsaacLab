@@ -1,0 +1,38 @@
+# Lift-Cube task profile.
+display_name: "Arm Pick-and-Place (Lift Cube)"
+type: manager_based
+train_script: soarm101/src/isaac_so_arm101/scripts/rsl_rl/train.py
+
+task_ids:
+  so100: Isaac-SO-ARM100-Lift-Cube-v0
+  so101: Isaac-SO-ARM101-Lift-Cube-v0
+
+goal_zones:
+  # Initial object placement range (pose_range of the reset event)
+  object_start_zone:
+    label: "Object spawn area (m)"
+    x: {path: "env.events.reset_object_position.params.pose_range.x", default: [-0.10, 0.10], limits: [-0.30, 0.30]}
+    y: {path: "env.events.reset_object_position.params.pose_range.y", default: [-0.20, 0.20], limits: [-0.30, 0.30]}
+  # Goal placement range (object_pose command)
+  target_zone:
+    label: "Goal area (m)"
+    x: {path: "env.commands.object_pose.ranges.pos_x", default: [0.10, 0.30], limits: [-0.35, 0.35]}
+    y: {path: "env.commands.object_pose.ranges.pos_y", default: [-0.25, 0.25], limits: [-0.35, 0.35]}
+    z: {path: "env.commands.object_pose.ranges.pos_z", default: [0.10, 0.30], limits: [0.0, 0.5]}
+
+behavior_presets:
+  balanced: {}
+  precise:
+    "env.rewards.object_goal_tracking_fine_grained.weight": 10.0
+  smooth:
+    "env.rewards.action_rate.weight": -0.001
+    "env.rewards.joint_vel.weight": -0.001
+
+# No-op overrides applied when sim2real is off (neutralizes arm and object randomization)
+dr_off_overrides:
+  "env.events.robot_joint_stiffness_and_damping.params.stiffness_distribution_params": [1.0, 1.0]
+  "env.events.robot_joint_stiffness_and_damping.params.damping_distribution_params": [1.0, 1.0]
+  "env.events.robot_joint_friction.params.friction_distribution_params": [0.0, 0.0]
+  "env.events.object_mass.params.mass_distribution_params": [1.0, 1.0]
+  "env.events.object_physics_material.params.static_friction_range": [1.0, 1.0]
+  "env.events.object_physics_material.params.dynamic_friction_range": [1.0, 1.0]

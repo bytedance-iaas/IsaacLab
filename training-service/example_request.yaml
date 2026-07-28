@@ -1,0 +1,24 @@
+# Example training request (what the frontend form produces / what the user fills in the console).
+# Two layers: the common base plus a task-specific section (goal).
+
+# --- Common base ---
+model: so101                 # so100 | so101 (existing URDFs)
+task: reach                  # see profiles/ for supported tasks
+training_budget: standard    # quick | standard | thorough
+sim2real_robustness: true    # enable physics domain randomization; helps real-robot transfer
+record_video: false          # record training video (written to logs/.../videos)
+seed: 42
+output_name: my_reach_v1
+behavior: balanced           # balanced | precise | smooth
+
+# --- Task-specific section (reach: goal area) ---
+goal:
+  target_zone:
+    x: [-0.10, 0.10]
+    y: [-0.25, -0.10]
+    z: [0.10, 0.30]
+
+# --- Advanced (optional): extra Hydra overrides, passed through verbatim ---
+advanced:
+  overrides: []
+  # e.g. ["agent.algorithm.learning_rate=5e-4", "env.episode_length_s=8.0"]
