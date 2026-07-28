@@ -28,6 +28,10 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--template", type=str, default=None,
+    help="Scene/reward template YAML applied on top of the base task (swap object USDs, add obstacles or rewards).",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -117,6 +121,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+    # Apply the scene/reward template on top of the base task; skipped entirely without --template.
+    if args_cli.template:
+        import yaml as _yaml
+        import isaaclab.envs.mdp as _core_mdp
+        sys.path.insert(0, "/workspace/isaaclab/training-service")
+        import template_env
+        with open(args_cli.template) as _f:
+            _tmpl = _yaml.safe_load(_f)
+        _notes = template_env.apply_template(env_cfg, _tmpl, _core_mdp)
+        print("[template] applied:", _notes, flush=True)
+
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
