@@ -6,3 +6,6 @@ RUN git config --system url."https://ghproxy.cc/github.com/".insteadOf "https://
       && git config --system http.sslVerify false
 
 RUN cd /workspace/isaaclab && ./isaaclab.sh --install
+
+RUN cd /workspace/isaaclab/soarm101 && \
+      /workspace/isaaclab/isaaclab.sh -p -m pip install -e . --no-deps
