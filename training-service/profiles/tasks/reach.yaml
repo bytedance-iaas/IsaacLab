@@ -1,0 +1,29 @@
+# Reach task-type profile (robot-agnostic). See robots.yaml for which robots support it.
+name: Reach
+desc: The arm end-effector moves to a randomly sampled goal point.
+# soarm101's train.py registers both the SO-ARM tasks and the stock isaaclab_tasks and is
+# rsl-rl 5.x compatible, so it can run every robot here (SO-ARM / Franka / UR); use it for all.
+train_script: soarm101/src/isaac_so_arm101/scripts/rsl_rl/train.py
+
+goal_zones:
+  target_zone:
+    label: Goal area (m)
+    axes:
+      x: {path: "env.commands.ee_pose.ranges.pos_x", default: [-0.10, 0.10], limits: [-0.35, 0.35], unit: m}
+      y: {path: "env.commands.ee_pose.ranges.pos_y", default: [-0.25, -0.10], limits: [-0.35, 0.35], unit: m}
+      z: {path: "env.commands.ee_pose.ranges.pos_z", default: [0.10, 0.30], limits: [0.0, 0.5], unit: m}
+
+behavior_presets:
+  balanced: {}
+  precise:
+    "env.rewards.end_effector_position_tracking_fine_grained.weight": 0.2
+    "env.rewards.end_effector_orientation_tracking.weight": -0.2
+  smooth:
+    "env.rewards.action_rate.weight": -0.001
+    "env.rewards.joint_vel.weight": -0.001
+
+# Applied only when the robot has dr==true and sim2real is off (neutralizes SO-ARM's DR terms)
+dr_off_overrides:
+  "env.events.robot_joint_stiffness_and_damping.params.stiffness_distribution_params": [1.0, 1.0]
+  "env.events.robot_joint_stiffness_and_damping.params.damping_distribution_params": [1.0, 1.0]
+  "env.events.robot_joint_friction.params.friction_distribution_params": [0.0, 0.0]

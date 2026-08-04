@@ -9,3 +9,7 @@ RUN cd /workspace/isaaclab && ./isaaclab.sh --install
 
 RUN cd /workspace/isaaclab/soarm101 && \
       /workspace/isaaclab/isaaclab.sh -p -m pip install -e . --no-deps
+
+# TOS python SDK: training-service/upload_tos.py uses it to push checkpoints to Volcengine TOS
+# once a training job finishes.
+RUN /workspace/isaaclab/isaaclab.sh -p -m pip install tos

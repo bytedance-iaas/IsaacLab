@@ -1,12 +1,15 @@
 """Schema definition and validation for training requests.
 
-Two layers:
-  - a common base shared by every task: model / task / training_budget / sim2real_robustness /
-    record_video / seed / output_name / behavior
-  - a task-specific section described by profiles/<task>.yaml: goal_zones (spatial ranges)
+Two layers, matching the frontend:
+  - robot catalog  profiles/robots.yaml      : robot -> supported tasks (task ids) and DR capability
+  - task profile   profiles/tasks/<task>.yaml: goal_zones / behavior_presets / dr_off_overrides
 
-Validation only needs the standard library and PyYAML, so it can run standalone; a backend
-validates with it before handing the request to the launcher.
+A request likewise has two layers:
+  - common base: robot / task / training_budget / sim2real_robustness / record_video / seed / output_name / behavior
+  - task-specific: goal (spatial or velocity ranges)
+
+Only the standard library and PyYAML are needed, so it runs standalone; a backend validates with
+it before handing the request to the launcher.
 """
 from __future__ import annotations
 
@@ -15,73 +18,77 @@ from typing import Any
 
 import yaml
 
-# --- Budget presets: training-length tier -> scale (calibrated on A30, tune as needed) ---
+# Budget presets: training-length tier -> scale (calibrate on the target GPU and adjust)
 BUDGET_PRESETS: dict[str, dict[str, int]] = {
-    "quick": {"num_envs": 256, "max_iterations": 200},       # ~minutes, smoke test
-    "standard": {"num_envs": 4096, "max_iterations": 1000},  # ~1 hour, usable policy
-    "thorough": {"num_envs": 8192, "max_iterations": 3000},  # ~hours, high quality
+    "quick": {"num_envs": 256, "max_iterations": 200},
+    "standard": {"num_envs": 4096, "max_iterations": 1000},
+    "thorough": {"num_envs": 8192, "max_iterations": 3000},
 }
 
-VALID_MODELS = ("so100", "so101")
 PROFILES_DIR = os.path.join(os.path.dirname(__file__), "profiles")
+ROBOTS_PATH = os.path.join(PROFILES_DIR, "robots.yaml")
+TASKS_DIR = os.path.join(PROFILES_DIR, "tasks")
 
 
 class ValidationError(Exception):
     """Validation failure; the message is meant to be shown to the user."""
 
 
-def available_tasks() -> list[str]:
-    """Currently supported tasks (one yaml per task under profiles/)."""
-    if not os.path.isdir(PROFILES_DIR):
-        return []
-    return sorted(f[:-5] for f in os.listdir(PROFILES_DIR) if f.endswith(".yaml"))
+def load_robots() -> dict[str, Any]:
+    with open(ROBOTS_PATH) as f:
+        return yaml.safe_load(f)
 
 
-def load_profile(task: str) -> dict[str, Any]:
-    path = os.path.join(PROFILES_DIR, f"{task}.yaml")
+def load_task(task: str) -> dict[str, Any]:
+    path = os.path.join(TASKS_DIR, f"{task}.yaml")
     if not os.path.isfile(path):
-        raise ValidationError(
-            f"unknown task '{task}'; supported: {', '.join(available_tasks()) or '(none)'}"
-        )
+        raise ValidationError(f"unknown task type '{task}'")
     with open(path) as f:
         return yaml.safe_load(f)
 
 
+def robot_dr(robot: str, robots: dict | None = None) -> Any:
+    """Return the robot's DR capability: True / False / 'builtin'."""
+    robots = robots or load_robots()
+    return robots.get(robot, {}).get("dr", False)
+
+
 def _check_range(name: str, val: Any, limits: list[float]) -> list[str]:
-    """Validate a [lo, hi] range: shape, lo <= hi, and that it stays within limits."""
-    errs: list[str] = []
     if not (isinstance(val, (list, tuple)) and len(val) == 2):
         return [f"{name}: expected two numbers as [min, max], got {val!r}"]
     lo, hi = val
     if not all(isinstance(x, (int, float)) for x in (lo, hi)):
         return [f"{name}: bounds must be numbers"]
+    errs = []
     if lo > hi:
         errs.append(f"{name}: lower bound {lo} must not exceed upper bound {hi}")
     lmin, lmax = limits
     if lo < lmin or hi > lmax:
-        errs.append(f"{name}: range [{lo}, {hi}] is outside the allowed interval [{lmin}, {lmax}]")
+        errs.append(f"{name}: range [{lo}, {hi}] is outside the feasible interval [{lmin}, {lmax}]")
     return errs
 
 
-def validate(request: dict[str, Any], profile: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Validate a training request. Raises ValidationError with every problem found; on success
+def validate(request: dict[str, Any]) -> dict[str, Any]:
+    """Validate a training request. Raises ValidationError listing every problem found; on success
     returns the request with defaults filled in."""
-    req = dict(request)  # shallow copy; never mutate the caller's object
+    req = dict(request)
     errors: list[str] = []
+    robots = load_robots()
+
+    # --- Robot and task ---
+    robot = req.get("robot")
+    if robot not in robots:
+        raise ValidationError(f"unknown robot '{robot}'; supported: {', '.join(robots)}")
+    rob = robots[robot]
+
+    task = req.get("task")
+    if task not in rob["tasks"]:
+        raise ValidationError(
+            f"robot '{robot}' does not support task '{task}' (it supports: {', '.join(rob['tasks'])})"
+        )
+    profile = load_task(task)
 
     # --- Common base ---
-    task = req.get("task")
-    if not task:
-        raise ValidationError("missing 'task'")
-    if profile is None:
-        profile = load_profile(task)
-
-    model = req.get("model")
-    if model not in VALID_MODELS:
-        errors.append(f"model must be one of {VALID_MODELS}, got {model!r}")
-    elif model not in profile["task_ids"]:
-        errors.append(f"task '{task}' does not support model '{model}' (supported: {list(profile['task_ids'])})")
-
     budget = req.setdefault("training_budget", "standard")
     if budget not in BUDGET_PRESETS:
         errors.append(f"training_budget must be one of {list(BUDGET_PRESETS)}, got {budget!r}")
@@ -99,10 +106,9 @@ def validate(request: dict[str, Any], profile: dict[str, Any] | None = None) -> 
     req.setdefault("seed", 42)
     if not isinstance(req["seed"], int):
         errors.append("seed must be an integer")
+    req.setdefault("output_name", f"{robot}_{task}")
 
-    req.setdefault("output_name", f"{model}_{task}")
-
-    # --- Task-specific section: goal_zones ---
+    # --- Task-specific: goal_zones ---
     zones_spec = profile.get("goal_zones", {})
     goal = req.setdefault("goal", {})
     if not isinstance(goal, dict):
@@ -111,12 +117,14 @@ def validate(request: dict[str, Any], profile: dict[str, Any] | None = None) -> 
         if zone_name not in zones_spec:
             errors.append(f"unknown zone '{zone_name}' (this task supports: {list(zones_spec)})")
             continue
+        axes = zones_spec[zone_name]["axes"]
         for axis, axis_val in zone_val.items():
-            axis_spec = zones_spec[zone_name].get(axis)
-            if axis_spec is None:
+            if axis not in axes:
                 errors.append(f"{zone_name}.{axis}: this zone has no such axis")
                 continue
-            errors += _check_range(f"{zone_name}.{axis}", axis_val, axis_spec["limits"])
+            label = axes[axis].get("name", axis)
+            errs = _check_range(f"{zones_spec[zone_name]['label']} · {label}", axis_val, axes[axis]["limits"])
+            errors += errs
 
     if errors:
         raise ValidationError("request validation failed:\n  - " + "\n  - ".join(errors))
