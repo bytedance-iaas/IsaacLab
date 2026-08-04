@@ -152,6 +152,57 @@ class EventCfg:
         },
     )
 
+    # --- sim2real domain randomization (physics) ---
+    # Randomize arm dynamics and object properties to improve sim2real transfer for grasping.
+    # Toggled by the client via sim2real_robustness; when off, the launcher nulls these terms.
+    robot_joint_stiffness_and_damping = EventTerm(
+        func=mdp.randomize_actuator_gains,
+        min_step_count_between_reset=200,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "stiffness_distribution_params": (0.9, 1.1),
+            "damping_distribution_params": (0.75, 1.5),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+
+    robot_joint_friction = EventTerm(
+        func=mdp.randomize_joint_parameters,
+        min_step_count_between_reset=200,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "friction_distribution_params": (0.0, 0.1),
+            "operation": "add",
+            "distribution": "uniform",
+        },
+    )
+
+    object_physics_material = EventTerm(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object", body_names="Object"),
+            "static_friction_range": (0.7, 1.2),
+            "dynamic_friction_range": (0.5, 1.0),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 64,
+        },
+    )
+
+    object_mass = EventTerm(
+        func=mdp.randomize_rigid_body_mass,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object", body_names="Object"),
+            "mass_distribution_params": (0.8, 1.2),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+
 
 @configclass
 class RewardsCfg:
