@@ -55,6 +55,15 @@ def build_command(request: dict[str, Any]) -> list[str]:
     if req.get("record_video"):
         argv += ["--video", "--video_length", "200", "--video_interval", "2000"]
 
+    # Optional scene/reward template: an inline template in the request is written to a file and
+    # passed to train.py via --template
+    tmpl = req.get("template")
+    if tmpl:
+        tpath = "/tmp/_launcher_template.yaml"
+        with open(tpath, "w", encoding="utf-8") as f:
+            yaml.safe_dump(tmpl, f, allow_unicode=True)
+        argv += ["--template", tpath]
+
     overrides: list[str] = []
 
     # 1) Task-specific: goal_zones -> command/event ranges
