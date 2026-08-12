@@ -54,9 +54,12 @@ def _job_manifest(k8s, name: str, req: dict) -> "object":
     """Build the training job: mount the request ConfigMap, request one GPU, run the launcher and
     then upload to TOS."""
     prefix = req.get("output_name") or name
+    # The report is a convenience, so it must not be able to cost the user their checkpoint: it runs
+    # under `|| true` so that a reporting bug still leaves the upload to run.
     cmd = (
         "set -e; cd /workspace/isaaclab/training-service; "
         "../isaaclab.sh -p launcher.py --config /config/request.yaml; "
+        "../isaaclab.sh -p make_report.py --latest || echo '[report] skipped'; "
         f"../isaaclab.sh -p upload_tos.py --prefix {prefix}"
     )
     container = k8s.V1Container(
