@@ -7,6 +7,17 @@ RUN git config --system url."https://ghproxy.cc/github.com/".insteadOf "https://
 
 RUN cd /workspace/isaaclab && ./isaaclab.sh --install
 
+# Overwrite the rsl-rl-lib 5.0.1 that --install pulls in with our port of it.
+# The port is the official 5.0.1 source plus the SAC stack (models/, sac.py,
+# off_policy_runner.py, replay_buffer.py) and two backward-compatible patches: mlp.py regains
+# its layer_norm argument, and logger.py accepts alpha and collection_size_override. The PPO
+# path is unchanged from official 5.0.1, so the soarm101 and Franka PPO demos need no
+# adjustment; SAC and OffPolicyRunner are added on top.
+# --force-reinstall is required because the version number is identical; --no-deps leaves
+# torch and the rest of the environment untouched.
+RUN cd /workspace/isaaclab/rsl_rl_port && \
+      /workspace/isaaclab/isaaclab.sh -p -m pip install --no-deps --force-reinstall .
+
 RUN cd /workspace/isaaclab/soarm101 && \
       /workspace/isaaclab/isaaclab.sh -p -m pip install -e . --no-deps
 
