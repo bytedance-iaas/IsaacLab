@@ -34,14 +34,20 @@ parser.add_argument("--export_io_descriptors", action="store_true", default=Fals
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
+parser.add_argument(
+    "--stream", action="store_true", default=False,
+    help="Publish training video (panorama + closeup) to LiveKit for live viewing in a browser. Demo only; keep num_envs small (~16).",
+)
+parser.add_argument("--stream_eye", type=float, nargs=3, default=None, help="Closeup camera position in world coordinates (x y z).")
+parser.add_argument("--stream_target", type=float, nargs=3, default=None, help="Closeup camera look-at point in world coordinates (x y z).")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
-if args_cli.video:
+# always enable cameras to record video / livekit stream
+if args_cli.video or args_cli.stream:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -124,6 +130,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # handle deprecated configurations
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
 
+    # Stream: add fixed-view cameras before the env is created (skipped entirely without --stream)
+    if args_cli.stream:
+        sys.path.insert(0, "/workspace/isaaclab/training-service")
+        import livekit_stream
+        livekit_stream.add_stream_camera(env_cfg)
+
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -196,6 +208,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+    # Stream: reset once to initialize the cameras, start the LiveKit publisher, then train as usual
+    if args_cli.stream:
+        sys.path.insert(0, "/workspace/isaaclab/training-service")
+        import livekit_stream
+        env.reset()
+        _kw = {}
+        if args_cli.stream_eye is not None:
+            _kw["close_eye"] = tuple(args_cli.stream_eye)
+        if args_cli.stream_target is not None:
+            _kw["close_target"] = tuple(args_cli.stream_target)
+        livekit_stream.start_publisher(env, **_kw)
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
