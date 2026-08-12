@@ -25,6 +25,11 @@ RUN cd /workspace/isaaclab/soarm101 && \
 # once a training job finishes.
 RUN /workspace/isaaclab/isaaclab.sh -p -m pip install tos
 
+# LiveKit SDK: with --stream, training publishes a panorama and a closeup view to LiveKit
+# (training-service/livekit_stream.py). Demo use only, at small num_envs (~16); real training
+# runs headless at high env counts without --stream.
+RUN /workspace/isaaclab/isaaclab.sh -p -m pip install livekit livekit-api
+
 # Standalone usd-core (a pxr independent of Kit's): used by inspect_usd.py to inspect uploaded
 # USD files. Installed into its own directory so it does not pollute the training environment.
 RUN /workspace/isaaclab/isaaclab.sh -p -m pip install --target /opt/usd-core usd-core
