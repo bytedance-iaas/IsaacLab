@@ -1,21 +1,19 @@
-# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
 # All rights reserved.
+#
 # SPDX-License-Identifier: BSD-3-Clause
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import (
-    RslRlOffPolicyRunnerCfg,
-    RslRlSacActorModelCfg,
-    RslRlSacAlgorithmCfg,
-    RslRlSacCriticModelCfg,
-)
+from isaaclab_rl.rsl_rl import RslRlOffPolicyRunnerCfg, RslRlSacActorModelCfg, RslRlSacAlgorithmCfg, RslRlSacCriticModelCfg
 
 
 @configclass
 class G1RoughSACRunnerCfg(RslRlOffPolicyRunnerCfg):
+    """Default SAC configuration for the rough G1 task."""
+
     num_steps_per_env = 24
-    max_iterations = 3000
+    max_iterations = 1500
     save_interval = 100
     log_interval = 1
     start_training = 1
@@ -33,31 +31,34 @@ class G1RoughSACRunnerCfg(RslRlOffPolicyRunnerCfg):
         hidden_dims=[1024, 512, 256],
         activation="swish",
         obs_normalization=True,
-        layer_norm=True,
+        layer_norm=False,
     )
     algorithm = RslRlSacAlgorithmCfg(
         replay_buffer_size=int(5.0e6),
         num_learning_epochs=1,
-        num_mini_batches=12,       # UTD ≈ 1: matches paper's per-step update rate
+        num_mini_batches=200,
         mini_batch_size=8192,
-        actor_learning_rate=3.0e-4,
-        critic_learning_rate=3.0e-4,
-        alpha_learning_rate=3.0e-4,
+        actor_learning_rate=2.0e-4,
+        critic_learning_rate=2.0e-4,
+        alpha_learning_rate=2.0e-5,
         gamma=0.97,
-        tau=0.005,
-        alpha=0.01,
+        tau=0.003,
+        alpha=0.001,
         auto_alpha=True,
-        target_entropy_scale=1.0,  # paper default: target = -action_dim = -23
+        target_entropy_scale=0.167,
         max_grad_norm=1.0,
         policy_frequency=1,
-        n_steps=1,
+        n_steps=5,
     )
 
 
 @configclass
 class G1FlatSACRunnerCfg(G1RoughSACRunnerCfg):
+    """Default SAC configuration for the flat G1 task."""
+
     def __post_init__(self):
         super().__post_init__()
+
         self.max_iterations = 600
         self.experiment_name = "g1_flat"
         self.actor.hidden_dims = [512, 256, 128]
