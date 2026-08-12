@@ -154,8 +154,64 @@ class RslRlCNNModelCfg(RslRlMLPModelCfg):
 
 
 ############################
+# SAC model configurations #
+############################
+
+
+@configclass
+class RslRlSacActorModelCfg:
+    """Configuration for the SAC actor model."""
+
+    class_name: str = "SACActorModel"
+    hidden_dims: list[int] = MISSING
+    activation: str = MISSING
+    obs_normalization: bool = MISSING
+    init_noise_std: float = MISSING
+    layer_norm: bool = MISSING
+    log_std_min: float = MISSING
+    log_std_max: float = MISSING
+
+
+@configclass
+class RslRlSacCriticModelCfg:
+    """Configuration for the SAC critic model."""
+
+    class_name: str = "SACCriticModel"
+    hidden_dims: list[int] = MISSING
+    activation: str = MISSING
+    obs_normalization: bool = MISSING
+    layer_norm: bool = MISSING
+
+
+############################
 # Algorithm configurations #
 ############################
+
+
+@configclass
+class RslRlSacAlgorithmCfg:
+    """Configuration for the SAC algorithm."""
+
+    class_name: str = "SAC"
+    replay_buffer_size: int = MISSING
+    num_learning_epochs: int = MISSING
+    num_mini_batches: int = MISSING
+    mini_batch_size: int = MISSING
+    actor_learning_rate: float = MISSING
+    critic_learning_rate: float = MISSING
+    alpha_learning_rate: float = MISSING
+    gamma: float = MISSING
+    tau: float = MISSING
+    alpha: float = MISSING
+    auto_alpha: bool = MISSING
+    target_entropy_scale: float = 1.0
+    max_grad_norm: float = MISSING
+    policy_frequency: int = MISSING
+    n_steps: int = MISSING
+    actor_optimizer: Literal["adam", "adamw", "sgd", "rmsprop"] = "adam"
+    critic_optimizer: Literal["adam", "adamw", "sgd", "rmsprop"] = "adam"
+    rnd_cfg: RslRlRndCfg | None = None
+    symmetry_cfg: RslRlSymmetryCfg | None = None
 
 
 @configclass
@@ -345,6 +401,18 @@ class RslRlOnPolicyRunnerCfg(RslRlBaseRunnerCfg):
     For rsl-rl >= 4.0.0, this configuration is is deprecated. Please use `actor` and `critic` model configurations
     instead.
     """
+
+
+@configclass
+class RslRlOffPolicyRunnerCfg(RslRlBaseRunnerCfg):
+    """Configuration of the runner for off-policy algorithms (SAC)."""
+
+    class_name: str = "OffPolicyRunner"
+    actor: RslRlSacActorModelCfg = MISSING
+    critic: RslRlSacCriticModelCfg = MISSING
+    algorithm: RslRlSacAlgorithmCfg = MISSING
+    log_interval: int = MISSING
+    start_training: int = MISSING
 
 
 #############################
