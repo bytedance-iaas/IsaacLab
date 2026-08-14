@@ -46,7 +46,10 @@ def _cam(prim, w, h):
     # frame a layout whose size is not known until then.
     return CameraCfg(
         prim_path=prim, height=h, width=w, data_types=["rgb"],
-        spawn=sim_utils.PinholeCameraCfg(focal_length=18.0, clipping_range=(0.05, 30.0)),
+        # Far plane 1000, not 30: the camera pulls back to frame the whole env grid, and on a
+        # generated rough terrain that puts the ground tens of metres away. With a 30 m far plane
+        # everything but the sky got clipped, and the stream showed a gradient over nothing.
+        spawn=sim_utils.PinholeCameraCfg(focal_length=18.0, clipping_range=(0.05, 1000.0)),
     )
 
 
