@@ -1,14 +1,20 @@
-"""Publish the live Isaac training view to LiveKit as two tracks: a panorama looking down on the
-whole env grid, and a closeup of a single robot.
+"""Publish the live Isaac training view to LiveKit as one track: a panorama looking down on the
+whole env grid.
+
+There was also a closeup track, framed by a fixed world-space pose. That pose was chosen for one
+arm task, so on any other robot or terrain it pointed at empty space -- a second video pane showing
+nothing is worse than no second pane. The panorama derives its framing from the env grid, so it
+adapts on its own.
 
 - Frames are read back (GPU to CPU) in the main thread's app update callback; touching CUDA from
   another thread causes an illegal memory access.
-- The LiveKit thread only reads CPU frames and publishes the two video tracks, "pano" and "closeup".
-- Called from train.py --stream; --stream_eye and --stream_target adjust the closeup camera.
+- The LiveKit thread only reads CPU frames and publishes the video track "pano".
+- Called from train.py --stream.
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 import time
 
@@ -18,25 +24,35 @@ import torch
 import isaaclab.sim as sim_utils
 from isaaclab.sensors import CameraCfg
 
-DEFAULT_URL = "ws://115.191.16.193:7880"
-DEFAULT_KEY = "isaackey"
-DEFAULT_SECRET = "isaacsecretABCDEF0123456789abcdef"
+# Where to publish. These are configuration, not constants: a deployment that is not ours has its
+# own LiveKit, and a run that hardcodes ours would either fail to connect or -- worse -- succeed,
+# putting someone else's training video on our server.
+#
+# The default is the in-cluster Service address rather than the load balancer's public IP: the
+# publisher runs inside the same cluster, so going out to the public IP and back in is a hairpin
+# that pays for a round trip and egress for nothing.
+DEFAULT_URL = os.environ.get("LIVEKIT_URL", "ws://livekit-isaac-clb.default.svc.cluster.local:7880")
+DEFAULT_KEY = os.environ.get("LIVEKIT_API_KEY", "")
+DEFAULT_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
+
+# One room per run, so two people training at the same time do not land in each other's video.
+DEFAULT_ROOM = os.environ.get("LIVEKIT_ROOM") or f"train-{os.environ.get('JOB_NAME', 'local')}"
 
 PANO_W, PANO_H = 960, 540      # panorama resolution
-CLOSE_W, CLOSE_H = 640, 360    # closeup resolution
 
 
 def _cam(prim, w, h):
+    # No offset: the pose is set from the env grid once the scene exists, which is the only way to
+    # frame a layout whose size is not known until then.
     return CameraCfg(
         prim_path=prim, height=h, width=w, data_types=["rgb"],
         spawn=sim_utils.PinholeCameraCfg(focal_length=18.0, clipping_range=(0.05, 30.0)),
-        offset=CameraCfg.OffsetCfg(pos=(0.9, 0.9, 0.7), rot=(1.0, 0.0, 0.0, 0.0), convention="world"),
     )
 
 
 def add_stream_camera(env_cfg):
-    """Add the panorama and closeup cameras to the scene before the env is created, and disable the
-    debug markers."""
+    """Add the panorama camera to the scene before the env is created, and disable the debug
+    markers."""
     for grp in ("commands", "scene"):
         obj = getattr(env_cfg, grp, None)
         if obj is not None:
@@ -44,7 +60,6 @@ def add_stream_camera(env_cfg):
                 if hasattr(term, "debug_vis"):
                     term.debug_vis = False
     env_cfg.scene.stream_pano = _cam("{ENV_REGEX_NS}/stream_pano", PANO_W, PANO_H)
-    env_cfg.scene.stream_close = _cam("{ENV_REGEX_NS}/stream_close", CLOSE_W, CLOSE_H)
 
 
 def _set_pose(cam, eye, target, device, n):
@@ -54,17 +69,25 @@ def _set_pose(cam, eye, target, device, n):
     )
 
 
-def start_publisher(env, room: str = "isaac", url: str = DEFAULT_URL,
-                    key: str = DEFAULT_KEY, secret: str = DEFAULT_SECRET, fps: int = 15,
-                    close_eye=(0.9, 0.9, 0.7), close_target=(0.2, 0.0, 0.15)):
+def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
+                    key: str = DEFAULT_KEY, secret: str = DEFAULT_SECRET, fps: int = 15):
     import omni.kit.app
     from livekit import api, rtc
+
+    if not key or not secret:
+        # Say so and carry on: --stream is a convenience, and losing the training run because the
+        # credentials for the video feed are missing would be the wrong trade.
+        print(
+            "[livekit] LIVEKIT_API_KEY / LIVEKIT_API_SECRET are not set, so no video will be"
+            " published. Training continues normally.",
+            flush=True,
+        )
+        return
 
     unwrapped = env.unwrapped
     device = unwrapped.device
     n = unwrapped.num_envs
     pano_cam = unwrapped.scene["stream_pano"]
-    close_cam = unwrapped.scene["stream_close"]
 
     # Panorama: derive the overhead pose from the env grid
     origins = unwrapped.scene.env_origins.float()
@@ -73,20 +96,15 @@ def start_publisher(env, room: str = "isaac", url: str = DEFAULT_URL,
     d = span * 0.65 + 2.0
     pano_eye = (center + torch.tensor([0.0, -d, d * 0.85 + 1.5], device=device)).tolist()
     pano_target = (center + torch.tensor([0.0, 0.0, 0.15], device=device)).tolist()
-    # Closeup: the offset is relative to env_0's origin, so add env_0's world position
-    # (env_0 is usually not at the world origin)
-    env0 = origins[0]
-    close_eye_w = (env0 + torch.tensor(list(close_eye), device=device)).tolist()
-    close_target_w = (env0 + torch.tensor(list(close_target), device=device)).tolist()
     try:
         _set_pose(pano_cam, pano_eye, pano_target, device, n)
-        _set_pose(close_cam, close_eye_w, close_target_w, device, n)
-        print(f"[livekit] cameras ready, panorama eye={[round(x,2) for x in pano_eye]} "
-              f"closeup eye (world)={[round(x,2) for x in close_eye_w]}", flush=True)
+        print(f"[livekit] camera ready, panorama eye={[round(x,2) for x in pano_eye]}", flush=True)
     except Exception as e:  # noqa: BLE001
         print("[livekit] failed to set camera pose:", e, flush=True)
 
-    shared = {"pano": None, "close": None, "srcs": None, "sub": None}
+    # "sub" holds the update subscription: dropping the handle would let it be collected and the
+    # capture callback would stop firing.
+    shared = {"pano": None, "sub": None}
     period = 1.0 / fps
     last = [0.0]
 
@@ -105,7 +123,6 @@ def start_publisher(env, room: str = "isaac", url: str = DEFAULT_URL,
             return
         try:
             shared["pano"] = _grab(pano_cam)
-            shared["close"] = _grab(close_cam)
             last[0] = now
         except Exception:  # noqa: BLE001
             pass
@@ -121,26 +138,19 @@ def start_publisher(env, room: str = "isaac", url: str = DEFAULT_URL,
             token = (
                 api.AccessToken(key, secret)
                 .with_identity("isaac-train").with_name("Isaac Training")
-                .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=True))
+                .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=False))
                 .to_jwt()
             )
             r = rtc.Room()
             await r.connect(url, token)
             src_p = rtc.VideoSource(PANO_W, PANO_H)
-            src_c = rtc.VideoSource(CLOSE_W, CLOSE_H)
             await r.local_participant.publish_track(
                 rtc.LocalVideoTrack.create_video_track("pano", src_p),
                 rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA))
-            await r.local_participant.publish_track(
-                rtc.LocalVideoTrack.create_video_track("closeup", src_c),
-                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA))
-            shared["srcs"] = (src_p, src_c)
-            print(f"[livekit] publishing training video (panorama + closeup) to room '{room}'", flush=True)
+            print(f"[livekit] publishing training video to room '{room}'", flush=True)
             while True:
                 if shared["pano"] is not None:
                     src_p.capture_frame(rtc.VideoFrame(PANO_W, PANO_H, rtc.VideoBufferType.RGBA, shared["pano"].tobytes()))
-                if shared["close"] is not None:
-                    src_c.capture_frame(rtc.VideoFrame(CLOSE_W, CLOSE_H, rtc.VideoBufferType.RGBA, shared["close"].tobytes()))
                 await asyncio.sleep(period)
 
         try:
