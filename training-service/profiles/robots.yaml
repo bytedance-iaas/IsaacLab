@@ -41,3 +41,15 @@ anymal_c:
   dr: builtin
   tasks:
     velocity: Isaac-Velocity-Flat-Anymal-C-v0
+
+# algorithms: which trainers this robot's tasks have configs registered for.
+# Omitted means [ppo]. SAC exists only where an rsl_rl_sac_cfg_entry_point is
+# registered -- the nine legged robots from the ETH reference; anymal_c is not
+# among them, which is why it does not carry the key.
+g1:
+  name: Unitree G1
+  group: Humanoid
+  dr: builtin
+  algorithms: [ppo, sac]
+  tasks:
+    velocity: Isaac-Velocity-Rough-G1-v0
