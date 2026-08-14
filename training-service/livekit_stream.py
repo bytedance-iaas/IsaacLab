@@ -92,7 +92,7 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
     n = unwrapped.num_envs
     pano_cam = unwrapped.scene["stream_pano"]
 
-    # Panorama: derive the overhead pose from the env grid
+    # Initial pose from the env grid, so there is a sensible view before the first frame.
     origins = unwrapped.scene.env_origins.float()
     center = origins.mean(dim=0)
     span = float((origins.max(dim=0).values - origins.min(dim=0).values).max().item())
@@ -104,6 +104,34 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
         print(f"[livekit] camera ready, panorama eye={[round(x,2) for x in pano_eye]}", flush=True)
     except Exception as e:  # noqa: BLE001
         print("[livekit] failed to set camera pose:", e, flush=True)
+
+    # Then follow the robots. Framing the origin grid only works when the grid is compact; on a
+    # generated terrain the origins span the whole map and the robots end up sub-pixel. So track
+    # the centroid of the actual robot positions, cap how much area the view tries to cover, and
+    # smooth the motion so resets do not yank the camera. Scenes without a "robot" articulation
+    # keep the static grid framing.
+    robot = unwrapped.scene.articulations.get("robot")
+    _MAX_VIEW_SPAN = 18.0   # metres of robot spread the view will try to contain
+    _EMA = 0.05             # per-tick smoothing; ~1.3 s to settle at 15 fps
+    _follow = {"c": None, "s": None}
+
+    def _follow_cam():
+        pos = robot.data.root_pos_w
+        c = pos.mean(dim=0)
+        s = float((pos.max(dim=0).values - pos.min(dim=0).values)[:2].max().item())
+        s = min(s, _MAX_VIEW_SPAN)
+        if _follow["c"] is None:
+            _follow["c"], _follow["s"] = c.clone(), s
+        else:
+            _follow["c"].mul_(1 - _EMA).add_(c, alpha=_EMA)
+            _follow["s"] = (1 - _EMA) * _follow["s"] + _EMA * s
+        cs, ss = _follow["c"], _follow["s"]
+        dd = ss * 0.65 + 2.0
+        eye = cs + torch.tensor([0.0, -dd, dd * 0.85 + 1.5], device=device)
+        tgt = cs + torch.tensor([0.0, 0.0, 0.15], device=device)
+        pano_cam.set_world_poses_from_view(
+            eyes=eye.unsqueeze(0).repeat(n, 1), targets=tgt.unsqueeze(0).repeat(n, 1)
+        )
 
     # "sub" holds the update subscription: dropping the handle would let it be collected and the
     # capture callback would stop firing.
@@ -125,6 +153,8 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
         if now - last[0] < period:
             return
         try:
+            if robot is not None:
+                _follow_cam()
             shared["pano"] = _grab(pano_cam)
             last[0] = now
         except Exception:  # noqa: BLE001
