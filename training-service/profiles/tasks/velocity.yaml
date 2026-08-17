@@ -4,7 +4,11 @@
 # there are no dr_off_overrides.
 name: Locomotion
 desc: The quadruped walks steadily at the commanded velocity (domain randomization is built in).
-train_script: soarm101/src/isaac_so_arm101/scripts/rsl_rl/train.py
+# The core script, not the soarm101 entry: every velocity robot (anymal_c, g1) is a core task,
+# and the soarm101 entry predates SAC -- it has no OffPolicyRunner dispatch, so a sac request
+# through it dies after scene build with "Unsupported runner class". The soarm101 entry remains
+# what the arm profiles use, since the core scripts cannot see that package's tasks.
+train_script: scripts/reinforcement_learning/rsl_rl/train.py
 
 goal_zones:
   speed:

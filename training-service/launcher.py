@@ -41,7 +41,9 @@ def build_command(request: dict[str, Any]) -> list[str]:
 
     task_id = rob["tasks"][req["task"]]
     dr = rob["dr"]  # True / False / "builtin"
-    budget = schema.BUDGET_PRESETS[req["training_budget"]]
+    budget = req["training_budget"]
+    if not isinstance(budget, dict):
+        budget = schema.BUDGET_PRESETS[budget]
     train_script = os.path.join(ISAACLAB_ROOT, profile["train_script"])
 
     argv: list[str] = [
@@ -52,6 +54,9 @@ def build_command(request: dict[str, Any]) -> list[str]:
         "--max_iterations", str(budget["max_iterations"]),
         "--seed", str(req["seed"]),
     ]
+    if req["algorithm"] == "sac":
+        # Registered alongside the PPO entry point on the robots that carry SAC configs.
+        argv += ["--agent", "rsl_rl_sac_cfg_entry_point"]
     if req.get("record_video"):
         argv += ["--video", "--video_length", "200", "--video_interval", "2000"]
 

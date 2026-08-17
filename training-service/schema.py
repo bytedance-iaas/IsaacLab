@@ -89,9 +89,26 @@ def validate(request: dict[str, Any]) -> dict[str, Any]:
     profile = load_task(task)
 
     # --- Common base ---
+    # Which trainer to use. Listed per robot in the catalog because SAC configs only exist where
+    # an entry point is registered -- accepting "sac" for a robot without one would fail deep in
+    # gym.make with an unhelpful KeyError instead of here with a clear message.
+    algorithm = req.setdefault("algorithm", "ppo")
+    allowed_algs = rob.get("algorithms", ["ppo"])
+    if algorithm not in allowed_algs:
+        errors.append(f"robot '{robot}' supports algorithms {allowed_algs}, got {algorithm!r}")
+
+    # A preset name, or an explicit {num_envs, max_iterations} pair. The explicit form exists for
+    # reproducing published configurations, which rarely coincide with the three tiers.
     budget = req.setdefault("training_budget", "standard")
-    if budget not in BUDGET_PRESETS:
-        errors.append(f"training_budget must be one of {list(BUDGET_PRESETS)}, got {budget!r}")
+    if isinstance(budget, dict):
+        for k in ("num_envs", "max_iterations"):
+            if not isinstance(budget.get(k), int) or budget[k] <= 0:
+                errors.append(f"training_budget.{k} must be a positive integer, got {budget.get(k)!r}")
+        extra = set(budget) - {"num_envs", "max_iterations"}
+        if extra:
+            errors.append(f"training_budget has unknown keys: {sorted(extra)}")
+    elif budget not in BUDGET_PRESETS:
+        errors.append(f"training_budget must be one of {list(BUDGET_PRESETS)} or a {{num_envs, max_iterations}} object, got {budget!r}")
 
     behavior = req.setdefault("behavior", "balanced")
     presets = profile.get("behavior_presets", {})

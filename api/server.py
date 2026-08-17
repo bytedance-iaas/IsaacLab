@@ -54,13 +54,25 @@ def _job_manifest(k8s, name: str, req: dict) -> "object":
     """Build the training job: mount the request ConfigMap, request one GPU, run the launcher and
     then upload to TOS."""
     prefix = req.get("output_name") or name
-    # The report is a convenience, so it must not be able to cost the user their checkpoint: it runs
-    # under `|| true` so that a reporting bug still leaves the upload to run.
+    # Everything runs from /workspace/isaaclab -- the one directory that matters, because the
+    # training script writes its logs to CWD/logs. The previous form ran from training-service/,
+    # which sent logs to training-service/logs where neither make_report --latest nor upload_tos
+    # (both defaulting to /workspace/isaaclab/logs) would ever look: the job would train
+    # successfully and upload nothing.
+    #
+    # Report and evaluation are conveniences and must not be able to cost the user their
+    # checkpoint, so both run under `||`. The upload runs last so it picks up everything the
+    # earlier steps produced -- report.md, the eval video, and exported/policy.onnx, which is the
+    # artifact that actually goes on a robot.
+    task_id = schema.load_robots()[req["robot"]]["tasks"][req["task"]]
+    agent_arg = " --agent rsl_rl_sac_cfg_entry_point" if req.get("algorithm") == "sac" else ""
     cmd = (
-        "set -e; cd /workspace/isaaclab/training-service; "
-        "../isaaclab.sh -p launcher.py --config /config/request.yaml; "
-        "../isaaclab.sh -p make_report.py --latest || echo '[report] skipped'; "
-        f"../isaaclab.sh -p upload_tos.py --prefix {prefix}"
+        "set -e; cd /workspace/isaaclab; "
+        "./isaaclab.sh -p training-service/launcher.py --config /config/request.yaml; "
+        "./isaaclab.sh -p training-service/make_report.py --latest || echo '[report] skipped'; "
+        f"./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --task {task_id}{agent_arg}"
+        " --num_envs 32 --headless --video --video_length 400 || echo '[eval] skipped'; "
+        f"./isaaclab.sh -p training-service/upload_tos.py --prefix {prefix}"
     )
     container = k8s.V1Container(
         name="train",
