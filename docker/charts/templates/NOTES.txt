@@ -8,6 +8,21 @@ Storage: data-{{ $fullname }}-0 ({{ .Values.persistence.size }}, {{ .Values.pers
 Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
 {{- end }}
 
+{{- if and $render (eq .Values.streaming.loadBalancer.addressType "PUBLIC") }}
+
+⚠️ THIS SESSION IS ON THE PUBLIC INTERNET, UNAUTHENTICATED
+  Isaac Sim's WebRTC endpoint authenticates nobody — there is no password step to fail. Anyone
+  who learns the address can drive this session: build, simulate, watch.
+{{- if .Values.streaming.exposeNvcfPort }}
+  Port {{ .Values.streaming.nvcfPort }} is published too, which is worse: it serves unauthenticated
+  asset conversion taking arbitrary file paths, and session termination. Turn off
+  streaming.exposeNvcfPort unless a client actually needs it.
+{{- end }}
+  Restrict it at the network layer — a CLB ACL or a security group rule allowing only the source
+  addresses that should reach it. The chart cannot do this for you. Or use
+  streaming.loadBalancer.addressType=PRIVATE and reach it over a bastion or VPN.
+{{- end }}
+
 {{- with (include "isaaclab.hardware.warning" . | trim) }}
 
 ⚠️ HARDWARE WARNING

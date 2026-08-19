@@ -10,11 +10,11 @@ type: application
 
 # Chart version. Bump on every packaging change. Independent of the appVersion below: the chart
 # can change without the application changing, and vice versa.
-# 0.2.0 wires up train.py --stream: the LiveKit server comes in as a dependency (livekit.enabled)
-# and the training container is pointed at it through LIVEKIT_URL / LIVEKIT_ROOM.
-# 0.1.0 is the first release. It covers both workloads through a single `mode` value: `train`
-# for headless Isaac Lab runs, `render` for a WebRTC-streamed Isaac Sim workstation.
-version: 0.2.0
+#
+# 0.1.0 is the first release. It covers both workloads through a single `mode` value — `train`
+# for headless Isaac Lab runs, `render` for a WebRTC-streamed Isaac Sim workstation — and pulls
+# in the livekit chart for live training views (livekit.enabled).
+version: 0.1.0
 
 # Isaac Lab release this chart targets. Not the image tag — the chart pins no image (image.tag is
 # required at install time), so this tracks the repository version instead.

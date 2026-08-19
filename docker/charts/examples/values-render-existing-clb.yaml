@@ -50,6 +50,8 @@ streaming:
     # The CLB currently serving the test environment's Isaac Sim stream (address
     # 115.190.190.201). Replace with your own for any other environment.
     existingId: clb-13g25lmrk0um83n6nu4lgus8l
+    # ⚠️ PUBLIC, overriding the chart's PRIVATE default on purpose — see values-render-new-clb.yaml
+    #    for what that means. Restrict the CLB by source address.
     addressType: PUBLIC
 
 hardware:

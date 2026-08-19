@@ -119,15 +119,37 @@ envFromSecrets: []
 # So the chart hands it the address: the load balancer below has a stable VIP, an init container
 # reads that VIP from the Kubernetes API, and the entrypoint passes it to Isaac Sim. The VIP
 # belongs to the Service rather than the pod, so it survives pod replacement and upgrades.
+#
+# ⚠️ THE STREAM HAS NO AUTHENTICATION. Isaac Sim's WebRTC endpoint authenticates nobody — there is
+#    no setting for it anywhere in the livestream extension, because the design assumes a trusted
+#    network. Anyone who can reach the signalling port can drive that Isaac Sim session: build,
+#    simulate, watch. Network reachability is the ONLY access control there is, which is why
+#    addressType defaults to PRIVATE below. Read the chart README before going PUBLIC.
 streaming:
   # WebRTC signalling. What the streaming client connects to.
   signallingPort: 49100
-  # HTTP API of the omni.services.livestream.nvcf extension.
-  nvcfPort: 8011
   # WebRTC media (UDP). Pinned with fixedHostPort so one port is exposed instead of the whole
   # 47998-48020 range Isaac Sim would otherwise pick from at session setup.
   # ⚠️ Changing this changes both the load balancer port and the Isaac Sim flag; they must agree.
   mediaPort: 47998
+
+  # HTTP API of the omni.services.livestream.nvcf extension.
+  nvcfPort: 8011
+  # Whether that port is published on the load balancer. OFF: it is by far the worst thing on this
+  # Service to expose, and almost certainly not needed.
+  #
+  # It serves 15 unauthenticated endpoints — verified by fetching /openapi.json from the VIP with
+  # no credentials — among them `POST /convert/asset/process`, which takes an arbitrary
+  # `import_path` and `output_path`, and `POST /v1/streaming/endsession`. None of the routes
+  # declare an auth dependency, and the container runs as root.
+  #
+  # Off by default because the streaming client does not appear to use it: Isaac Lab's own
+  # `--livestream 1` sets only `port=49100` and never mentions 8011, which is the NVCF platform's
+  # orchestration API rather than part of the client protocol.
+  #
+  # ⚠️ That last part is INFERRED, not proven. If a client stops connecting after an upgrade, turn
+  #    this back on — and say so, because it means the inference was wrong.
+  exposeNvcfPort: false
 
   # Skip the lookup and advertise this address verbatim. Normally left empty — the init container
   # discovers the VIP on its own. Set it when the client reaches the pod through something the
@@ -150,10 +172,17 @@ streaming:
     # create=false: REQUIRED. The CLB instance id, e.g. clb-xxxxxxxxxxxxxxxx.
     existingId: ""
 
-    # PUBLIC puts the VIP on the internet; PRIVATE keeps it inside the VPC.
-    # ⚠️ PUBLIC means the stream is reachable from the internet. Isaac Sim's WebRTC endpoint has
-    #    no authentication of its own — restrict it at the CLB or the security group.
-    addressType: PUBLIC
+    # PRIVATE keeps the VIP inside the VPC; PUBLIC puts it on the internet.
+    #
+    # ⚠️ PUBLIC PUBLISHES AN UNAUTHENTICATED SESSION TO THE INTERNET. Anyone who learns the
+    #    address can drive that Isaac Sim — there is no password step to fail. The default is
+    #    PRIVATE so that reaching it takes a bastion or a VPN, and going public has to be a
+    #    decision somebody wrote down rather than something that happened by default.
+    #
+    #    If you do need PUBLIC, restrict it at the network layer — the chart cannot: put a CLB
+    #    ACL or a security group rule in front of it, allowing only the source addresses that
+    #    should have it. See "Exposure and hardening" in the chart README.
+    addressType: PRIVATE
 
     # create=true: optional. Which subnet the CLB is placed in. Empty lets the platform choose.
     # ⚠️ Must be in THIS cluster's VPC. A subnet from another VPC is the usual reason a CLB never

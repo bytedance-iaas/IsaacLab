@@ -49,11 +49,15 @@ spec:
       port: {{ .Values.streaming.signallingPort }}
       targetPort: {{ .Values.streaming.signallingPort }}
       protocol: TCP
+    {{- if .Values.streaming.exposeNvcfPort }}
     # HTTP API of the omni.services.livestream.nvcf extension.
+    # ⚠️ 15 unauthenticated endpoints, including arbitrary-path asset conversion and session
+    # termination. Off by default; see streaming.exposeNvcfPort in values.yaml.
     - name: nvcf-http
       port: {{ .Values.streaming.nvcfPort }}
       targetPort: {{ .Values.streaming.nvcfPort }}
       protocol: TCP
+    {{- end }}
     # WebRTC media. Bound lazily by Isaac Sim at session setup, so it stays absent from
     # /proc/net/udp until the first client connects -- that is expected, not a fault.
     - name: media

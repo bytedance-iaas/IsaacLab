@@ -45,9 +45,11 @@ streaming:
   loadBalancer:
     # Provision a new CLB with this release.
     create: true
-    # Reachable from the internet.
-    # ⚠️ Isaac Sim's WebRTC endpoint has no authentication of its own. Restrict it at the CLB or
-    #    the security group if the scene or the simulation is sensitive.
+    # ⚠️ PUBLIC, and deliberately so: this example is the test cluster, reached from outside
+    #    the VPC. It publishes an UNAUTHENTICATED Isaac Sim session — anyone who learns the
+    #    address can drive it, since the endpoint has no password step at all.
+    #    Put a CLB ACL or security group rule in front of it allowing only the addresses that
+    #    should reach it. The chart default is PRIVATE; this file overrides it on purpose.
     addressType: PUBLIC
     # Empty lets the platform choose. If the CLB never gets an address, a subnet outside this
     # cluster's VPC is the usual cause — set it explicitly then.

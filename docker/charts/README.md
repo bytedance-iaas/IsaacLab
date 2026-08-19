@@ -97,6 +97,73 @@ replacement and upgrades.
 Set `streaming.publicEndpoint` to skip the lookup — and the RBAC with it — when clients reach the
 pod through something the cluster knows nothing about, such as a DNAT rule.
 
+## Exposure and hardening
+
+**Isaac Sim's WebRTC endpoint authenticates nobody.** There is no setting for it anywhere in the
+livestream extension — the design assumes a trusted network. Anyone who can reach the signalling
+port can drive that session: build scenes, run the simulation, watch it. There is no password step
+to fail, so a leaked address is full access.
+
+That makes network reachability the only access control there is, which is why
+`streaming.loadBalancer.addressType` defaults to **`PRIVATE`**.
+
+What each path exposes:
+
+| Path | Exposed | Authenticated |
+|---|---|---|
+| `mode=train` | nothing | — |
+| `mode=render` | signalling 49100/TCP, media 47998/UDP | **no** |
+| `mode=render` + `exposeNvcfPort` | the above, plus 8011/TCP | **no**, and far worse — see below |
+| LiveKit dependency | 7880/7881 TCP, 7882/UDP | **yes** — JWT signed with the API key; without one the server answers `401 no permissions to access the room` |
+
+### Port 8011 is off, and should stay off
+
+`streaming.exposeNvcfPort` defaults to `false`. That port serves the `omni.services.livestream.nvcf`
+extension's HTTP API: **15 unauthenticated endpoints**, confirmed by fetching `/openapi.json` from
+the VIP with no credentials. Among them:
+
+```
+POST /convert/asset/process     import_path / output_path / archive_path
+POST /convert/cad/process       import_path / output_path / config_path
+POST /v1/streaming/endsession
+GET  /metrics
+```
+
+`import_path` is documented as "Full path to source asset" and `output_path` is an arbitrary
+output path. The container runs as **root**. None of the routes declare an auth dependency. So
+publishing this port is not "someone can watch your scene" — it is arbitrary-path file access and
+the ability to end sessions at will.
+
+It is off because the streaming client does not appear to need it: Isaac Lab's own
+`--livestream 1` sets only `port=49100` and never mentions 8011, which is the NVCF platform's
+orchestration API rather than part of the client protocol. **That is inference, not proof.** If a
+client stops connecting after upgrading, set `streaming.exposeNvcfPort=true` — and say so, because
+it means the inference was wrong and this default needs revisiting.
+
+### If you need PUBLIC
+
+The chart cannot restrict access — a `LoadBalancer` Service has no allowlist to render. Do it at
+the network layer, and do it *before* the address is handed out:
+
+1. **Restrict by source address.** Put an ACL on the CLB, or a security group rule on its backends,
+   allowing only the offices, VPN egress addresses or bastion hosts that should reach it. This is
+   the only control that actually stands between the internet and the session.
+2. **Publish the narrowest port set.** Leave `exposeNvcfPort=false`. Signalling and media are
+   enough for a client to connect.
+3. **Treat the address as a credential**, since in effect it is the only one. Do not put it in
+   tickets, chat or dashboards that outlive the deployment.
+4. **Take it down when it is not in use.** A workstation left running over a weekend is an
+   unauthenticated session on the internet for two days. `helm uninstall`, or scale the
+   StatefulSet to zero.
+
+The safer shape, when it fits, is `PRIVATE` plus a bastion or VPN: the same access, but reaching
+it requires an account somewhere that *does* authenticate.
+
+> ⚠️ Anything deployed from the hand-written manifests this chart replaces was public. Installing
+> the chart over it lands on `PRIVATE`, which re-provisions the CLB — **the address changes**. Set
+> `streaming.loadBalancer.addressType=PUBLIC` explicitly to keep a public one, ideally along with
+> the ACL that should have been there.
+
 ## Load balancer — two ways
 
 ### A. Provision a new CLB
