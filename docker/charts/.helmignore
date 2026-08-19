@@ -1,0 +1,13 @@
+# Editor and OS leftovers — these would otherwise end up inside `helm package` output.
+.DS_Store
+*.swp
+*.swo
+*.bak
+*~
+.idea/
+.vscode/
+
+# VCS
+.git/
+.gitignore
+

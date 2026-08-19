@@ -1,0 +1,181 @@
+# Defaults are installable-anywhere, not tuned for any one cluster: training mode, no node pin,
+# no image tag and no load balancer. The image serves two different workloads and `mode` picks
+# which one this release runs.
+
+# WHICH WORKLOAD THIS RELEASE RUNS.
+#
+#   train   Isaac Lab training. Nothing is exposed — you `kubectl exec` in and launch a run by
+#           hand. The pod idles on `sleep infinity`. No Service, no RBAC, no load balancer.
+#
+#   render  An Isaac Sim workstation, streamed to a WebRTC client: build scenes, simulate, watch
+#           it render. Adds a load balancer for the stream, the RBAC the pod needs to discover
+#           its own public address, and starts Isaac Sim automatically.
+#
+# The two need different hardware. See `hardware` at the bottom of this file, and the chart
+# README for the instance types each one is validated on.
+mode: train
+
+# Resource names come from the RELEASE name. ⚠️ The name also determines the PVC
+# (data-<name>-0), so renaming an EXISTING release strands its disk and starts on an empty one.
+# Pick the release name deliberately; do not rename later.
+nameOverride: ""
+
+image:
+  # The registry holding your build.
+  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab
+  # REQUIRED, and deliberately empty: the chart does not track the image. Builds are tagged per
+  # commit and there is no `latest`, so hardcoding one here would mean republishing the chart for
+  # every build — the chart version and the image version are not the same thing.
+  # Pass it at deploy time: `--set image.tag=<tag>`.
+  # ⚠️ Verify the tag exists before deploying: a tag that was never built gives ImagePullBackOff.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Empty on purpose. The GPU request below is what schedules the pod, so pinning a node is never
+# required — and an instance type from one cluster leaves the pod Pending forever on any other.
+# Fill it only to force a specific machine or GPU model, e.g.
+#   nodeSelector: { node.kubernetes.io/instance-type: <instance-type> }
+#   nodeSelector: { kubernetes.io/hostname: <node-name> }
+#
+# ⚠️ The two modes do NOT accept the same hardware: training wants compute, rendering needs a GPU
+# with a display engine and the NVENC encoder the WebRTC stream feeds off. A machine that trains
+# happily may not render at all. If you intend to do both on one node, the instance type has to
+# be in BOTH lists under `hardware` below — see the chart README for the matrix.
+#
+# ⚠️ Worth doing once a PVC exists: zonal volumes (ebs-*) cannot follow a pod rescheduled into
+# another zone, so it can never attach the disk it already has.
+nodeSelector: {}
+
+tolerations: []
+affinity: {}
+
+# Container resources. ⚠️ nvidia.com/gpu is non-compressible: requests and limits MUST be equal
+# or the API server rejects the pod. cpu/memory may differ (cpu is compressible, you just get
+# throttled).
+#
+# One GPU is the right default for both modes: a render workstation drives a single display
+# pipeline, and a training smoke run fits. Raise the GPU count for real multi-GPU training.
+resources:
+  requests: { cpu: "8", memory: 64Gi, nvidia.com/gpu: "1" }
+  limits:   { cpu: "32", memory: 256Gi, nvidia.com/gpu: "1" }
+
+persistence:
+  # A block storage class from your cluster. Must support ReadWriteOnce.
+  storageClass: ""
+  size: 500Gi
+  # ⚠️ NOT /workspace, and not /workspace/isaaclab. Isaac Lab and the Isaac Sim install both live
+  # under /workspace/isaaclab IN THE IMAGE — mounting a volume over that path hides the entire
+  # installation and nothing starts. Keep this on a path the image does not populate.
+  mountPath: /data
+  # The claim is a StatefulSet volumeClaimTemplate, which binds if-exists: the PVC name is
+  # derived as data-<release>-<ordinal>, and an existing one is REUSED with all its data rather
+  # than replaced. So a reinstall keeps checkpoints, and `helm uninstall` deliberately leaves the
+  # PVC behind — delete it by hand to reclaim the disk.
+  # ⚠️ volumeClaimTemplates is IMMUTABLE: changing size or storageClass on an existing release
+  # makes `helm upgrade` fail.
+
+# /dev/shm for multi-process simulation and the PyTorch DataLoader. The 64Mi container default
+# overflows ("Bus error" / "out of shared memory") and the container cannot remount it without
+# CAP_SYS_ADMIN. Memory-backed, so it counts against resources.limits.memory — keep it well
+# under that.
+dshmSize: 16Gi
+
+# An ORDERED LIST, not a map: Helm's `range` sorts map keys, and reordering container env changes
+# the pod-template hash — which would restart the pod on upgrade for no reason.
+env:
+  # Required for GPU rendering inside the container.
+  - { name: NVIDIA_DRIVER_CAPABILITIES, value: all }
+
+# Secrets mounted as environment, e.g. TOS or LiveKit credentials. Each is optional, so a missing
+# one does not block startup.
+envFromSecrets: []
+  # - tos-creds
+  # - livekit-creds
+
+# ---------------------------------------------------------------------------------------------
+# RENDER MODE ONLY. Ignored entirely when mode=train.
+# ---------------------------------------------------------------------------------------------
+#
+# HOW THE STREAM REACHES A CLIENT, and why this is more involved than exposing a port:
+#
+# Isaac Sim streams over WebRTC. Signalling (TCP) only exchanges an SDP; the video travels over
+# UDP. The server has to advertise a REACHABLE address inside that SDP as an ICE candidate, and
+# on its own it only knows the address its socket is bound to — a private pod IP. A client given
+# such a candidate can never connect: signalling succeeds, the logs look healthy, and the picture
+# never arrives because ICE stays in checking.
+#
+# No proxy can fix this. Advertising an address is an application-level act and a transparent
+# proxy cannot rewrite the SDP body; an HTTP API gateway additionally cannot carry the UDP media
+# at all. Isaac Sim exposes no STUN/TURN settings either, so it cannot discover the address by
+# itself.
+#
+# So the chart hands it the address: the load balancer below has a stable VIP, an init container
+# reads that VIP from the Kubernetes API, and the entrypoint passes it to Isaac Sim. The VIP
+# belongs to the Service rather than the pod, so it survives pod replacement and upgrades.
+streaming:
+  # WebRTC signalling. What the streaming client connects to.
+  signallingPort: 49100
+  # HTTP API of the omni.services.livestream.nvcf extension.
+  nvcfPort: 8011
+  # WebRTC media (UDP). Pinned with fixedHostPort so one port is exposed instead of the whole
+  # 47998-48020 range Isaac Sim would otherwise pick from at session setup.
+  # ⚠️ Changing this changes both the load balancer port and the Isaac Sim flag; they must agree.
+  mediaPort: 47998
+
+  # Skip the lookup and advertise this address verbatim. Normally left empty — the init container
+  # discovers the VIP on its own. Set it when the client reaches the pod through something the
+  # cluster knows nothing about, such as a DNAT rule or an external proxy.
+  publicEndpoint: ""
+
+  loadBalancer:
+    # Two ways to get a load balancer:
+    #   create: true   PROVISION a new CLB. Its VIP is assigned on creation and reported back on
+    #                  the Service; the init container waits for it. Takes 10-30s, and bills.
+    #   create: false  REUSE an existing CLB by id. Put it in existingId. Use this to keep an
+    #                  address people have already bookmarked, or to share one CLB across
+    #                  releases on distinct ports.
+    #
+    # ⚠️ A CLB this chart provisioned is DELETED with the Service on `helm uninstall`, and its
+    #    VIP goes with it — reinstalling gets a different address. Reuse an existing CLB for
+    #    anything whose address is written down somewhere.
+    create: true
+
+    # create=false: REQUIRED. The CLB instance id, e.g. clb-xxxxxxxxxxxxxxxx.
+    existingId: ""
+
+    # PUBLIC puts the VIP on the internet; PRIVATE keeps it inside the VPC.
+    # ⚠️ PUBLIC means the stream is reachable from the internet. Isaac Sim's WebRTC endpoint has
+    #    no authentication of its own — restrict it at the CLB or the security group.
+    addressType: PUBLIC
+
+    # create=true: optional. Which subnet the CLB is placed in. Empty lets the platform choose.
+    # ⚠️ Must be in THIS cluster's VPC. A subnet from another VPC is the usual reason a CLB never
+    #    gets a VIP and the init container waits forever.
+    subnetId: ""
+
+    # Extra annotations on the Service, for CLB options this chart does not model.
+    annotations: {}
+
+    # How long the init container waits for the VIP before giving up, in 5s attempts.
+    waitAttempts: 120
+
+# ---------------------------------------------------------------------------------------------
+# Hardware matrix. Advisory only — the chart NEVER fails on these, it prints a warning in the
+# install notes when nodeSelector pins an instance type that is not listed for the mode.
+#
+# ⚠️ PLACEHOLDER VALUES. Both lists are empty, which disables the warning entirely. Fill them in
+# with the instance types validated in your environment; see the chart README for the reasoning
+# (rendering needs a display engine and NVENC, training does not).
+#
+# If a release is meant to both train and render on one node, the instance type must appear in
+# BOTH lists — the intersection is the only hardware that can do both.
+# ---------------------------------------------------------------------------------------------
+hardware:
+  # The nodeSelector key that carries the instance type. Only used to find the value to check.
+  instanceTypeKey: node.kubernetes.io/instance-type
+  # Instance types validated for mode=render (display engine + NVENC encoder).
+  renderInstanceTypes: []
+  # Instance types validated for mode=train.
+  trainInstanceTypes: []

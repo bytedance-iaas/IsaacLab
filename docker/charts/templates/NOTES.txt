@@ -1,0 +1,67 @@
+{{- $fullname := include "isaaclab.fullname" . -}}
+{{- $render := eq (include "isaaclab.isRender" .) "true" -}}
+Isaac Lab is deployed as {{ $fullname }} in namespace {{ .Release.Namespace }}, in {{ .Values.mode }} mode.
+
+Pod:     {{ $fullname }}-0
+Storage: data-{{ $fullname }}-0 ({{ .Values.persistence.size }}, {{ .Values.persistence.storageClass }}) at {{ .Values.persistence.mountPath }}
+{{- if $render }}
+Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
+{{- end }}
+
+{{- with (include "isaaclab.hardware.warning" . | trim) }}
+
+⚠️ HARDWARE WARNING
+  {{ . }}
+{{- end }}
+
+1. Wait for the pod:
+
+     kubectl rollout status statefulset/{{ $fullname }} -n {{ .Release.Namespace }}
+
+{{- if $render }}
+{{- if .Values.streaming.publicEndpoint }}
+
+2. Isaac Sim starts on its own and advertises {{ .Values.streaming.publicEndpoint }}, which you
+   set explicitly. Point a WebRTC streaming client at:
+
+     {{ .Values.streaming.publicEndpoint }}:{{ .Values.streaming.signallingPort }}
+
+   ⚠️ Make sure that address really reaches this pod. It is advertised to clients verbatim and
+   is never verified — a wrong one fails as a black screen, not an error.
+{{- else }}
+
+2. Get the address the stream is published on:
+
+     kubectl get svc {{ include "isaaclab.streamServiceName" . }} -n {{ .Release.Namespace }} \
+       -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+   The pod discovers this by itself — nothing needs to be configured. To confirm it did:
+
+     kubectl logs {{ $fullname }}-0 -n {{ .Release.Namespace }} -c wait-clb-ip
+
+   Point a WebRTC streaming client at that address on port {{ .Values.streaming.signallingPort }}.
+{{- end }}
+
+3. Watch Isaac Sim start. It runs in the foreground, so its log is the container log:
+
+     kubectl logs -f {{ $fullname }}-0 -n {{ .Release.Namespace }}
+
+   The UDP media port ({{ .Values.streaming.mediaPort }}) is bound lazily, at session setup. It
+   stays absent until the first client connects — that is expected. To check it once connected,
+   without any tools in the image:
+
+     kubectl exec {{ $fullname }}-0 -n {{ .Release.Namespace }} -- \
+       sh -c 'grep -i ":$(printf %04X {{ .Values.streaming.mediaPort }}) " /proc/net/udp'
+
+   ⚠️ If signalling connects but the picture never arrives, try the native streaming client or
+   Firefox before suspecting the network: Chrome and Safari have a known issue with Isaac Sim
+   running in a container.
+{{- else }}
+
+2. Exec in and launch training:
+
+     kubectl exec -it {{ $fullname }}-0 -n {{ .Release.Namespace }} -- bash
+
+   Nothing is exposed in train mode, by design. Write checkpoints and logs under
+   {{ .Values.persistence.mountPath }} so they survive the pod.
+{{- end }}

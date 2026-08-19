@@ -1,0 +1,43 @@
+{{/*
+Lets the init container read back the address assigned to this release's load balancer Service.
+Render mode only, and skipped when the address is supplied explicitly -- then nothing reads the
+API and the pod runs as the namespace default ServiceAccount.
+
+Scoped as tightly as the API allows: one verb, one resource, and resourceNames pinned to the
+single Service this release owns. It cannot enumerate Services or read any other one.
+*/}}
+{{- if and (eq (include "isaaclab.isRender" .) "true") (not .Values.streaming.publicEndpoint) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "isaaclab.serviceAccountName" . }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "isaaclab.serviceAccountName" . }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: [{{ include "isaaclab.streamServiceName" . | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "isaaclab.serviceAccountName" . }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "isaaclab.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "isaaclab.serviceAccountName" . }}
+{{- end }}

@@ -1,0 +1,27 @@
+apiVersion: v2
+name: isaaclab
+description: Isaac Lab on Kubernetes — training workloads, or an Isaac Sim workstation streamed over WebRTC
+type: application
+
+# Chart version. Bump on every packaging change. Independent of the appVersion below: the chart
+# can change without the application changing, and vice versa.
+# 0.1.0 is the first release. It covers both workloads through a single `mode` value: `train`
+# for headless Isaac Lab runs, `render` for a WebRTC-streamed Isaac Sim workstation.
+version: 0.1.0
+
+# Isaac Lab release this chart targets. Not the image tag — the chart pins no image (image.tag is
+# required at install time), so this tracks the repository version instead.
+appVersion: "2.3.2"
+
+keywords:
+  - isaac-lab
+  - isaac-sim
+  - reinforcement-learning
+  - webrtc
+  - gpu
+  - kubernetes
+  - helm
+
+home: https://isaac-sim.github.io/IsaacLab/
+sources:
+  - https://github.com/bytedance-iaas/IsaacLab
