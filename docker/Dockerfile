@@ -51,6 +51,25 @@ RUN mkdir -p /root/.config/pip && \
     printf '[global]\nindex-url = %s\ntrusted-host = %s\n' \
         "${PIP_INDEX_URL}" "${PIP_TRUSTED_HOST}" > /root/.config/pip/pip.conf
 
+# tini becomes PID 1 (see ENTRYPOINT at the end of this file). curl and gnupg are needed to
+# add the repository below; the base image carries wget but neither of these.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tini curl gnupg ca-certificates && \
+    apt -y autoremove && apt clean autoclean && \
+    rm -rf /var/lib/apt/lists/*
+
+# oniond (onion-ai-data), the Volcengine data acceleration daemon, from the internal
+# extra-tools repository. That repository resolves only on the Volcengine network, so this is
+# gated the same way as the mirrors -- a NO_MIRROR=1 build simply omits oniond.
+RUN if [ "$NO_MIRROR" != "1" ]; then \
+        curl -fsSL https://mirrors.ivolces.com/extra-tools/ubuntu/GPG-KEY-system \
+            | gpg --dearmor -o /etc/apt/trusted.gpg.d/volc-extra-tools.gpg && \
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/trusted.gpg.d/volc-extra-tools.gpg] http://mirrors.ivolces.com/extra-tools/ubuntu jammy main" \
+            > /etc/apt/sources.list.d/volctools.list && \
+        apt-get update && apt-get install -y onion-ai-data && \
+        apt clean autoclean && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 COPY . /workspace/isaaclab/
 
 RUN git config --system url."https://ghproxy.cc/github.com/".insteadOf "https://github.com/" \
@@ -84,3 +103,13 @@ RUN /workspace/isaaclab/isaaclab.sh -p -m pip install livekit livekit-api
 # Standalone usd-core (a pxr independent of Kit's): used by inspect_usd.py to inspect uploaded
 # USD files. Installed into its own directory so it does not pollute the training environment.
 RUN /workspace/isaaclab/isaaclab.sh -p -m pip install --target /opt/usd-core usd-core
+
+# tini as PID 1. Isaac Sim spawns child processes and re-parents them on exit; without an init
+# that calls wait(), those pile up as zombies, and a bare process as PID 1 also ignores SIGTERM
+# by default, so the container would only ever stop by the runtime's kill timeout.
+#
+# NOTE for Kubernetes: a pod-level `command:` REPLACES this ENTRYPOINT and drops tini with it.
+# Put the process in `args:` instead and leave `command:` unset, so the container ends up
+# running `tini -- <args>`. The Helm chart in docker/charts does exactly that.
+ENTRYPOINT ["tini", "--"]
+CMD ["/bin/bash"]
