@@ -1,0 +1,40 @@
+# Isaac Lab training. Nothing is exposed — exec into the pod and launch a run.
+#
+#   helm install isaaclab-train ./docker/charts \
+#     -f docker/charts/examples/values-train.yaml \
+#     --set image.tag=<tag>
+#
+# Values below are for the Volcengine test cluster; adjust for anywhere else.
+
+mode: train
+
+image:
+  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab
+  # Left to the command line: builds are tagged per commit and there is no `latest`.
+  tag: ""
+
+# No node pin. The GPU request is what schedules the pod, and training does not need the
+# display engine that rendering does — so any GPU node in the cluster will do.
+#
+# Pin it only to reach specific hardware, e.g.:
+#   nodeSelector: { node.kubernetes.io/instance-type: ecs.gna3c.7xlarge }
+nodeSelector: {}
+
+resources:
+  requests: { cpu: "8", memory: 64Gi, nvidia.com/gpu: "1" }
+  limits:   { cpu: "32", memory: 256Gi, nvidia.com/gpu: "1" }
+
+persistence:
+  storageClass: ebs-essd
+  size: 500Gi
+  # NOT under /workspace/isaaclab — a volume there would hide the Isaac Lab install.
+  # Write checkpoints and logs here so they outlive the pod.
+  mountPath: /data
+
+dshmSize: 16Gi
+
+# Checkpoint upload (TOS) and the optional LiveKit demo stream read their credentials here.
+# Both are optional, so a missing Secret does not block startup.
+envFromSecrets:
+  - tos-creds
+  - livekit-creds

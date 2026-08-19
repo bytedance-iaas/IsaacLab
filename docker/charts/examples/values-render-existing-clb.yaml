@@ -1,0 +1,52 @@
+# Isaac Sim workstation, streamed over WebRTC, on an EXISTING load balancer.
+#
+#   helm install isaaclab-render ./docker/charts \
+#     -f docker/charts/examples/values-render-existing-clb.yaml \
+#     --set image.tag=<tag>
+#
+# Use this to keep an address people already have. Binding to a CLB by id means the release can
+# be uninstalled and reinstalled without the address changing, which a provisioned CLB cannot
+# promise — that one is deleted along with the release.
+#
+# Find the id of a CLB an earlier release provisioned:
+#
+#   kubectl get svc <release>-stream -n <namespace> \
+#     -o jsonpath='{.metadata.labels.service\.beta\.kubernetes\.io/volcengine-loadbalancer-id}'
+#
+# ⚠️ Do not point two releases at one CLB on the same ports — the second one's listeners collide
+#    with the first. Sharing a CLB is only safe when the port sets are distinct.
+#
+# Values below are for the Volcengine test cluster; adjust for anywhere else.
+
+mode: render
+
+image:
+  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab
+  tag: ""
+
+nodeSelector:
+  node.kubernetes.io/instance-type: ecs.gna3c.7xlarge
+
+resources:
+  requests: { cpu: "8", memory: 64Gi, nvidia.com/gpu: "1" }
+  limits:   { cpu: "32", memory: 256Gi, nvidia.com/gpu: "1" }
+
+persistence:
+  storageClass: ebs-essd
+  size: 500Gi
+  mountPath: /data
+
+dshmSize: 16Gi
+
+streaming:
+  loadBalancer:
+    # Bind to the CLB below instead of provisioning one.
+    create: false
+    # The CLB currently serving the test environment's Isaac Sim stream (address
+    # 115.190.190.201). Replace with your own for any other environment.
+    existingId: clb-13g25lmrk0um83n6nu4lgus8l
+    addressType: PUBLIC
+
+hardware:
+  renderInstanceTypes:
+    - ecs.gna3c.7xlarge
