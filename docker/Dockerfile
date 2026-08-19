@@ -104,6 +104,12 @@ RUN /workspace/isaaclab/isaaclab.sh -p -m pip install livekit livekit-api
 # USD files. Installed into its own directory so it does not pollute the training environment.
 RUN /workspace/isaaclab/isaaclab.sh -p -m pip install --target /opt/usd-core usd-core
 
+# Render-mode entrypoint: starts Isaac Sim in the foreground with WebRTC streaming. Baked into
+# the image rather than mounted so the deployment carries no copy of it -- the chart only names
+# it in args:. Training mode does not use it and runs `sleep infinity` instead.
+COPY docker/start-workstation.sh /usr/local/bin/start-workstation.sh
+RUN chmod +x /usr/local/bin/start-workstation.sh
+
 # tini as PID 1. Isaac Sim spawns child processes and re-parents them on exit; without an init
 # that calls wait(), those pile up as zombies, and a bare process as PID 1 also ignores SIGTERM
 # by default, so the container would only ever stop by the runtime's kill timeout.
