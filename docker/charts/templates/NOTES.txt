@@ -64,4 +64,36 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
 
    Nothing is exposed in train mode, by design. Write checkpoints and logs under
    {{ .Values.persistence.mountPath }} so they survive the pod.
+{{- $lkurl := include "isaaclab.stream.url" . }}
+{{- if .Values.livekit.enabled }}
+
+3. A LiveKit server was deployed with this release. Get the address viewers connect to:
+
+     kubectl get svc {{ include "isaaclab.livekit.serviceName" . }} -n {{ .Release.Namespace }} \
+       -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+   ⚠️ THIS SERVER IS SHARED. Point other training releases at it with:
+
+     --set stream.url={{ $lkurl }}
+
+   and leave livekit.enabled=false on those. Uninstalling THIS release stops the server for every
+   run still publishing to it. The CLB and its public address survive
+   {{- if .Values.livekit.service.keepOnUninstall }} (service.keepOnUninstall is on){{ else }} only if service.keepOnUninstall is turned on — it is currently OFF, so the address would be lost{{ end }}.
+
+4. Publish a training view to it by adding --stream to a run:
+
+     ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+       --task <task> --num_envs 16 --headless --stream
+
+   It publishes to room {{ include "isaaclab.stream.room" . }}. Demo use — keep num_envs small.
+
+   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
+      A run using it belongs on an instance type valid for BOTH modes.
+{{- else if $lkurl }}
+
+3. Training can publish a live view to {{ $lkurl }} (room {{ include "isaaclab.stream.room" . }})
+   by adding --stream to a run. That server is NOT managed by this release.
+
+   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
+{{- end }}
 {{- end }}

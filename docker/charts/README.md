@@ -7,6 +7,10 @@ Helm packaging of the Isaac Lab image, which serves two different jobs. One valu
 | `train` | Isaac Lab training. Nothing exposed — exec in and launch a run. | StatefulSet, headless Service, PVC |
 | `render` | An Isaac Sim workstation streamed over WebRTC: build scenes, simulate, watch it render. | The above, plus a load balancer, RBAC and an init container |
 
+Training runs can additionally publish a live view to **LiveKit** for browser viewing
+(`train.py --stream`) — see [Watching a training run](#watching-a-training-run-livekit). That path
+is outbound-only, so it costs the training pod no exposure at all.
+
 Both get a GPU, a persistent disk and a large `/dev/shm`. Training idles on `sleep infinity`;
 rendering starts Isaac Sim itself, in the foreground, so its log is the container log.
 
@@ -128,6 +132,105 @@ kubectl get svc <release>-stream -n <namespace> \
 
 > ⚠️ Do not point two releases at one CLB **on the same ports** — the second one's listeners
 > collide with the first. Sharing is only safe when the port sets are distinct.
+
+## Watching a training run (LiveKit)
+
+`train.py --stream` publishes the training view to LiveKit, where people watch it in a browser.
+Note the direction, because it is the whole point:
+
+**The training pod connects OUT to LiveKit and never accepts a connection.** No load balancer, no
+public address, no RBAC on the training side. A hundred training runs share one public entry
+point instead of needing a hundred — which is exactly what `mode=render` cannot do, and why the
+two paths are different.
+
+It is **one-way video**. Viewers watch; they cannot touch the simulation. Interactive work is what
+`mode=render` is for, and no amount of LiveKit replaces it — LiveKit is a video relay, Isaac Sim's
+own WebRTC is a remote desktop protocol carrying input back. Setting `livekit.enabled=true` on a
+`mode=render` release is rejected for that reason.
+
+### The server comes from a dependency
+
+The LiveKit server is the `livekit` chart from the same OCI registry, declared in `Chart.yaml`
+and gated on `livekit.enabled`. It is not reimplemented here: it already solves the same problems
+this chart would have had to (advertising the CLB's VIP to clients, provisioning the CLB) and
+additionally keeps the CLB on uninstall — which matters, because that public IP is baked into
+every viewer's URL.
+
+```bash
+helm dependency update ./docker/charts     # required before install or package
+```
+
+`docker/publish_charts.sh` does this itself. The fetched tarballs under `charts/` are gitignored;
+`Chart.lock` pins the version and digest.
+
+Everything under the `livekit:` key belongs to that chart — see its own `values.yaml` for the full
+set. `nameOverride` is pinned to `livekit` here rather than left to default, for two reasons: the
+dependency names its objects `<name>-ip`, which would otherwise collide with this chart's own
+ServiceAccount, and a shared server should have a stable address that does not change with
+whichever release happens to own it. You get `livekit-clb`, `livekit-auth`, and so on.
+
+### Deploy it once, point everything else at it
+
+```yaml
+# The one release that owns the server
+livekit:
+  enabled: true
+  service:
+    subnetId: subnet-xxxxxxxx      # required, must be in this cluster's VPC
+    keepOnUninstall: true
+```
+```bash
+--set livekit.auth.keys="devkey: $(openssl rand -hex 32)"
+```
+
+Every other training release brings up nothing and just publishes to it:
+
+```yaml
+livekit:
+  enabled: false
+stream:
+  url: ws://livekit-clb.<namespace>.svc.cluster.local:7880
+  existingSecret: livekit-auth
+```
+
+> ⚠️ Turning `enabled: true` on per training run gives you N servers and N load balancers, which
+> is **worse than not using LiveKit at all**. Uninstalling the owning release stops the server for
+> everyone still publishing to it — though with `keepOnUninstall` the CLB and its address survive.
+
+Prefer the **in-cluster** URL over the public VIP: the publisher runs inside the cluster, so going
+out to the public address and back is a hairpin that pays for a round trip and egress for nothing.
+
+### One Secret, both ends
+
+The dependency creates a Secret (`livekit-auth`) holding LiveKit's own credential format:
+
+```
+keys: "api_key: api_secret"
+```
+
+The publisher reads **that same Secret**, as `LIVEKIT_KEYS`. `livekit_stream.py` accepts this form
+in addition to the split `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` precisely so one credential can
+serve both ends — a second copy in another shape is free to drift, and the failure mode is a
+connection that authenticates and then fails, which looks nothing like a configuration mistake.
+
+> ⚠️ `livekit.auth.keys` goes into the Helm release history **verbatim**, readable by anyone who
+> can run `helm get values`. The dependency takes it that way deliberately: it is installed from
+> the VKE console's Helm page, which has no shell, so "create the Secret first" is not something
+> anyone can do there. Use a dedicated key, not one shared with anything else.
+
+### The server has the same address problem
+
+LiveKit must advertise an address its clients can reach, and inside a pod it only knows a private
+one — the identical problem Isaac Sim has, and the dependency solves it the identical way: an init
+container reads the CLB's VIP from the Kubernetes API and passes it as `--node-ip`. Setting
+`livekit.nodeIp` explicitly skips the lookup and drops that RBAC with it. (LiveKit can also
+discover this itself via STUN, which is not used because it needs a reachable public STUN server.)
+
+### `--stream` needs a rendering GPU
+
+It builds a camera sensor and reads frames back, so a run using it needs a GPU that can **render**,
+not merely compute. Such a run is the "both jobs on one node" case from the hardware section: its
+instance type must be in **both** lists.
 
 ## Defaults worth knowing
 

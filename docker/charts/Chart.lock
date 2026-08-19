@@ -1,0 +1,6 @@
+dependencies:
+- name: livekit
+  repository: oci://iaas-us-cn-beijing.cr.volces.com/physicalai
+  version: 0.3.2
+digest: sha256:c9c709be0372620cdfa37da9b208dc3843d968a2114eb280b09a902a7252f480
+generated: "2026-08-19T13:22:22.080591-07:00"

@@ -162,6 +162,98 @@ streaming:
     waitAttempts: 120
 
 # ---------------------------------------------------------------------------------------------
+# LIVE VIEWING OF A TRAINING RUN (`train.py --stream`)
+# ---------------------------------------------------------------------------------------------
+#
+# Training publishes its view to a LiveKit server and people watch from a browser. Note the
+# direction: the training pod CONNECTS OUT to LiveKit and never accepts a connection, so it needs
+# no load balancer, no public address and no RBAC of its own. That is the whole reason this path
+# exists next to mode=render — a hundred training runs share one public entry point instead of
+# needing a hundred.
+#
+# It is one-way video. Viewers watch; they cannot touch the simulation. Interactive work is what
+# mode=render is for, and LiveKit cannot stand in for it: LiveKit relays video, while Isaac Sim's
+# own WebRTC is a remote desktop protocol that carries input back.
+#
+# ⚠️ `--stream` renders a camera view, so a run using it needs a GPU that can RENDER, not merely
+#    compute — the "both jobs on one node" case in `hardware` below.
+
+# The publisher side: which server this release's training runs publish to. Independent of
+# whether this release also deploys one.
+stream:
+  # Where to publish, e.g. ws://livekit-clb.default.svc.cluster.local:7880
+  #
+  # Empty is usually right. It is derived from the LiveKit dependency when livekit.enabled=true,
+  # and otherwise the publisher falls back to the default compiled into livekit_stream.py. Set it
+  # to reach a server deployed by another release.
+  #
+  # Prefer the in-cluster address over the public VIP: the publisher runs inside the cluster, so
+  # going out to the public IP and back is a hairpin that pays for a round trip and egress for
+  # nothing.
+  url: ""
+
+  # Room name. One room per run keeps two people training at the same time out of each other's
+  # video. Empty derives it from the release name.
+  room: ""
+
+  # Secret holding the LiveKit credentials, in LiveKit's own `keys` format (`api_key: api_secret`).
+  # Empty derives the one the dependency creates when livekit.enabled=true — so both ends read the
+  # SAME Secret and cannot end up with different credentials.
+  #
+  # Set it only to reach a server deployed elsewhere; it is then that release's <name>-auth.
+  existingSecret: ""
+
+# ---------------------------------------------------------------------------------------------
+# The LiveKit server itself. Everything under this key belongs to the `livekit` DEPENDENCY
+# declared in Chart.yaml — see that chart's own values.yaml for the full set; only the keys that
+# matter here are repeated.
+#
+# ⚠️ LiveKit is SHARED infrastructure. Turn this on for exactly ONE release — a bootstrap install,
+#    or the first training release in a new environment — and leave it false everywhere else,
+#    pointing those at the existing server through stream.url. Deploying one per training run
+#    gives you N servers and N load balancers, which is worse than not using LiveKit at all.
+#
+# ⚠️ Uninstalling the release that owns the server takes the server away from every run still
+#    publishing to it. Its CLB survives by default (service.keepOnUninstall), so the address at
+#    least stays claimed.
+# ---------------------------------------------------------------------------------------------
+livekit:
+  enabled: false
+
+  # Fixed rather than release-derived, for two reasons: the dependency names its objects
+  # <name>-ip, which would otherwise collide with this chart's own ServiceAccount, and a shared
+  # server should have a stable address that does not change with whichever release happens to
+  # own it. Gives livekit-clb, livekit-auth, and so on.
+  nameOverride: livekit
+
+  auth:
+    # REQUIRED when enabled. LiveKit's `keys` map, one `api_key: api_secret` pair per line:
+    #
+    #   auth:
+    #     keys: |
+    #       devkey: <openssl rand -hex 32>
+    #
+    # ⚠️ This value goes into the Helm release history verbatim, where anyone who can run
+    #    `helm get values` will read it. The dependency takes it this way deliberately — the
+    #    install path is the VKE console's Helm page, which has no shell, so "create the Secret
+    #    first" is not something anyone can do there. Use a dedicated key, not a shared one.
+    keys: ""
+
+  service:
+    # REQUIRED when enabled, and specific to your cluster: the CLB is created from this subnet,
+    # which must be in the cluster's VPC. A subnet from elsewhere is the usual reason the CLB
+    # never gets a public IP and media never connects.
+    subnetId: ""
+    addressType: internet
+    # Keeps the CLB when the release is uninstalled. Leave true for anything real: that public IP
+    # is baked into every client's URL, and deleting it does not give the address back.
+    keepOnUninstall: true
+    ports:
+      signal: 7880
+      rtcTcp: 7881
+      rtcUdp: 7882
+
+# ---------------------------------------------------------------------------------------------
 # Hardware matrix. Advisory only — the chart NEVER fails on these, it prints a warning in the
 # install notes when nodeSelector pins an instance type that is not listed for the mode.
 #

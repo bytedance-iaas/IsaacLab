@@ -109,6 +109,31 @@ spec:
             - name: ISAACSIM_PUBLIC_ENDPOINT
               value: {{ . | quote }}
             {{- end }}
+            {{- else }}
+            {{/*
+            Where `train.py --stream` publishes its view. Only set when there is something to
+            point at; otherwise livekit_stream.py falls back to its own compiled-in default.
+            */}}
+            {{- with (include "isaaclab.stream.url" .) }}
+            - name: LIVEKIT_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: LIVEKIT_ROOM
+              value: {{ include "isaaclab.stream.room" . | quote }}
+            {{- with (include "isaaclab.stream.secretName" .) }}
+            # LiveKit's own `keys` format ("api_key: api_secret"), read straight from the Secret
+            # the server itself uses. livekit_stream.py accepts this form precisely so that one
+            # credential serves both ends: a second copy in another shape would be free to drift,
+            # and the failure mode is a connection that authenticates and then fails.
+            # optional, because --stream is a convenience and its credentials must never be able
+            # to stop a training run from starting.
+            - name: LIVEKIT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: keys
+                  optional: true
+            {{- end }}
             {{- end }}
           {{- with .Values.envFromSecrets }}
           envFrom:

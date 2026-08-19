@@ -35,6 +35,18 @@ DEFAULT_URL = os.environ.get("LIVEKIT_URL", "ws://livekit-isaac-clb.default.svc.
 DEFAULT_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 DEFAULT_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
+# LIVEKIT_KEYS is LiveKit's own credential format -- "api_key: api_secret", one pair per line --
+# and it is what the server itself reads from its Secret. Accepting it here lets the publisher
+# mount that same Secret rather than a second copy in split-variable form. Two copies of one
+# credential are free to drift, and the failure mode is a connection that authenticates and then
+# fails, which looks nothing like a configuration mistake. The split variables win when set, so
+# nothing that worked before changes.
+if not DEFAULT_KEY:
+    _keys = os.environ.get("LIVEKIT_KEYS", "").strip()
+    if _keys:
+        _key, _, _secret = _keys.splitlines()[0].partition(":")
+        DEFAULT_KEY, DEFAULT_SECRET = _key.strip(), _secret.strip()
+
 # One room per run, so two people training at the same time do not land in each other's video.
 DEFAULT_ROOM = os.environ.get("LIVEKIT_ROOM") or f"train-{os.environ.get('JOB_NAME', 'local')}"
 

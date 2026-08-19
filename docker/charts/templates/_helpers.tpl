@@ -57,7 +57,77 @@ both can exist; the init container looks this one up by name.
 {{- define "isaaclab.streamServiceName" -}}
 {{- printf "%s-stream" (include "isaaclab.fullname" .) }}
 {{- end }}
+{{/*
+Object names belonging to the `livekit` DEPENDENCY. That chart derives them from its own
+nameOverride (falling back to the release name), so these must follow the same rule -- and it is
+why this chart pins livekit.nameOverride to a fixed value rather than letting it default.
+*/}}
+{{- define "isaaclab.livekit.name" -}}
+{{- default .Release.Name .Values.livekit.nameOverride }}
+{{- end }}
 
+{{- define "isaaclab.livekit.serviceName" -}}
+{{- printf "%s-clb" (include "isaaclab.livekit.name" .) }}
+{{- end }}
+
+{{- define "isaaclab.livekit.secretName" -}}
+{{- printf "%s-auth" (include "isaaclab.livekit.name" .) }}
+{{- end }}
+
+{{/*
+Where the training publisher sends its video.
+
+Explicit stream.url wins. Otherwise, if this release brings up a server, address that one
+in-cluster -- the publisher runs inside the cluster, so routing out to the public VIP and back
+would be a hairpin paying for a round trip and egress for nothing. With neither, this is empty
+and the publisher falls back to the default compiled into livekit_stream.py.
+*/}}
+{{- define "isaaclab.stream.url" -}}
+{{- if .Values.stream.url }}
+{{- .Values.stream.url }}
+{{- else if .Values.livekit.enabled }}
+{{- printf "ws://%s.%s.svc.cluster.local:%v" (include "isaaclab.livekit.serviceName" .) .Release.Namespace .Values.livekit.service.ports.signal }}
+{{- end }}
+{{- end }}
+
+{{/*
+The Secret the publisher reads its credentials from. Defaults to the one the dependency creates,
+so both ends read the SAME object -- two copies of one credential drift, and the failure mode is
+a connection that authenticates and then fails.
+
+It holds LiveKit's own `keys` format rather than split variables, which livekit_stream.py accepts
+for exactly this reason.
+*/}}
+{{- define "isaaclab.stream.secretName" -}}
+{{- if .Values.stream.existingSecret }}
+{{- .Values.stream.existingSecret }}
+{{- else if .Values.livekit.enabled }}
+{{- include "isaaclab.livekit.secretName" . }}
+{{- end }}
+{{- end }}
+
+{{- define "isaaclab.stream.room" -}}
+{{- default (printf "train-%s" (include "isaaclab.fullname" .)) .Values.stream.room }}
+{{- end }}
+
+{{/*
+Only the combinations this chart is responsible for. auth.keys and service.subnetId are the
+dependency's own required values and it fails on them itself; repeating those checks here would
+mean maintaining the same rule in two charts.
+*/}}
+{{- define "isaaclab.livekit.validate" -}}
+{{- if .Values.livekit.enabled }}
+{{- if eq .Values.mode "render" }}
+{{- fail "livekit.enabled=true with mode=render: LiveKit carries the training view (train.py --stream), while mode=render streams the interactive Isaac Sim session over its own WebRTC endpoint. LiveKit relays one-way video and cannot carry input back, so it cannot stand in for the render path. Deploy the LiveKit server from a train-mode release." }}
+{{- end }}
+{{- if .Values.stream.url }}
+{{- fail "stream.url must be empty when livekit.enabled=true: this release brings up its own server and the chart addresses it in-cluster. Set stream.url only to publish to a server owned by another release (with livekit.enabled=false)." }}
+{{- end }}
+{{- if .Values.stream.existingSecret }}
+{{- fail "stream.existingSecret must be empty when livekit.enabled=true: the publisher reads the Secret the dependency creates, so that both ends share one credential. Set it only when publishing to a server owned by another release." }}
+{{- end }}
+{{- end }}
+{{- end }}
 {{/*
 The chart ships no default image tag, so catch it here: an empty tag would otherwise render as
 "repo:" and surface much later as a confusing ImagePullBackOff.
@@ -89,6 +159,7 @@ failure -- the whole framework simply vanishes from the image -- so it is reject
 {{- end }}
 
 {{- include "isaaclab.streaming.validate" . }}
+{{- include "isaaclab.livekit.validate" . }}
 {{- end }}
 
 {{/*

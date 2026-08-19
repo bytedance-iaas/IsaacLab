@@ -72,6 +72,11 @@ fi
 # keeps the chart's identity in one place and this script out of the business of
 # parsing YAML.
 mkdir -p "${work}/pkg"
+# The chart depends on the livekit chart from the same OCI registry. Without this the lint
+# below reports a missing dependency and `helm package` ships a chart that cannot render its
+# LiveKit path.
+helm dependency update "${chart_dir}"
+
 # Both modes are linted. They render different objects -- render mode alone brings up the
 # load balancer Service, the RBAC and an init container -- so linting just the default
 # would let a template error in the render-only path ship unnoticed.
