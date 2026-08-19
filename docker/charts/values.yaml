@@ -189,6 +189,26 @@ streaming:
     #    gets a VIP and the init container waits forever.
     subnetId: ""
 
+    # Public bandwidth cap, Mbps. THE PLATFORM DEFAULT IS 1 Mbps, which cannot carry video: the
+    # stream connects, ICE completes, and the picture is a slideshow or stalls outright. That
+    # failure looks like a broken stream rather than a capped link, so this is set explicitly.
+    #
+    # 10 Mbps is a working floor for one 1080p session. Raise it for higher resolution, a higher
+    # frame rate, or more than one concurrent viewer.
+    #
+    # ⚠️ Only applies when the chart CREATES the CLB. Binding to an existing one (create=false)
+    #    inherits whatever that CLB was given — check it in the console.
+    # ⚠️ Verify after deploying. The CCM echoes these annotations back verbatim whether or not it
+    #    understands them, so a wrong key looks identical to a working one from kubectl. Both
+    #    documented spellings are sent for that reason; neither could be confirmed against the
+    #    vendor docs, and the authoritative reading is the EIP's bandwidth in the console.
+    bandwidthMbps: 10
+
+    # EIP billing. Empty leaves it to the platform, which is the right default: the two modes
+    # (by bandwidth / by traffic) have very different cost profiles and picking one for you would
+    # be presumptuous. Set it deliberately if you know which you want.
+    eipBillingType: ""
+
     # Extra annotations on the Service, for CLB options this chart does not model.
     annotations: {}
 

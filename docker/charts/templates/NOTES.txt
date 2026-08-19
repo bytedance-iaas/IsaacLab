@@ -55,6 +55,13 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
      kubectl logs {{ $fullname }}-0 -n {{ .Release.Namespace }} -c wait-clb-ip
 
    Point a WebRTC streaming client at that address on port {{ .Values.streaming.signallingPort }}.
+{{- if .Values.streaming.loadBalancer.create }}
+
+   ⚠️ Check the bandwidth on that CLB's public IP in the console. The chart asked for
+   {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps, but the platform echoes the request
+   back whether or not it honoured it, so kubectl cannot tell you. The default it falls back to
+   is 1 Mbps, which cannot carry video — the stream connects and then stalls.
+{{- end }}
 {{- end }}
 
 3. Watch Isaac Sim start. It runs in the foreground, so its log is the container log:

@@ -180,6 +180,32 @@ Created with the release, address assigned in 10–30s, and the init container w
 > ⚠️ **`helm uninstall` deletes it, and the address goes too.** A reinstall comes back on a
 > different one. Once anybody has that address, switch to B.
 
+### Bandwidth — the default cannot carry video
+
+**The platform default is 1 Mbps.** A stream on that link connects, completes ICE, and then
+delivers a slideshow or stalls outright — which reads as a broken stream rather than a capped
+link, so it costs an afternoon to diagnose.
+
+`streaming.loadBalancer.bandwidthMbps` defaults to **10**, a working floor for a single 1080p
+session. Raise it for higher resolution, a higher frame rate, or concurrent viewers.
+
+```yaml
+streaming:
+  loadBalancer:
+    bandwidthMbps: 10
+    eipBillingType: ""     # empty = platform default; by-bandwidth and by-traffic differ a lot in cost
+```
+
+> ⚠️ **Verify it in the console after deploying.** The CCM echoes these annotations back verbatim
+> whether or not it understands them — measured on this cluster: a probe Service carrying two
+> different spellings had *both* returned in
+> `system-volcengine-loadbalancer-last-applied-annotations`, with no warning either way. A wrong
+> key therefore looks identical to a working one from `kubectl`. The chart sends both documented
+> spellings for that reason, but the authoritative reading is the EIP's bandwidth in the console.
+
+Only applies when the chart **creates** the CLB. Binding to an existing one inherits whatever
+bandwidth that CLB already has.
+
 ### B. Bind to an existing CLB
 
 ```yaml
