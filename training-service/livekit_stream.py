@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 """Publish the live Isaac training view to LiveKit as one track: a panorama looking down on the
 whole env grid.
 
@@ -11,6 +16,7 @@ adapts on its own.
 - The LiveKit thread only reads CPU frames and publishes the video track "pano".
 - Called from train.py --stream.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -35,17 +41,32 @@ DEFAULT_URL = os.environ.get("LIVEKIT_URL", "ws://livekit-isaac-clb.default.svc.
 DEFAULT_KEY = os.environ.get("LIVEKIT_API_KEY", "")
 DEFAULT_SECRET = os.environ.get("LIVEKIT_API_SECRET", "")
 
+# LIVEKIT_KEYS is LiveKit's own credential format -- "api_key: api_secret", one pair per line --
+# and it is what the server itself reads from its Secret. Accepting it here lets the publisher
+# mount that same Secret rather than a second copy in split-variable form. Two copies of one
+# credential are free to drift, and the failure mode is a connection that authenticates and then
+# fails, which looks nothing like a configuration mistake. The split variables win when set, so
+# nothing that worked before changes.
+if not DEFAULT_KEY:
+    _keys = os.environ.get("LIVEKIT_KEYS", "").strip()
+    if _keys:
+        _key, _, _secret = _keys.splitlines()[0].partition(":")
+        DEFAULT_KEY, DEFAULT_SECRET = _key.strip(), _secret.strip()
+
 # One room per run, so two people training at the same time do not land in each other's video.
 DEFAULT_ROOM = os.environ.get("LIVEKIT_ROOM") or f"train-{os.environ.get('JOB_NAME', 'local')}"
 
-PANO_W, PANO_H = 960, 540      # panorama resolution
+PANO_W, PANO_H = 960, 540  # panorama resolution
 
 
 def _cam(prim, w, h):
     # No offset: the pose is set from the env grid once the scene exists, which is the only way to
     # frame a layout whose size is not known until then.
     return CameraCfg(
-        prim_path=prim, height=h, width=w, data_types=["rgb"],
+        prim_path=prim,
+        height=h,
+        width=w,
+        data_types=["rgb"],
         # Far plane 1000, not 30: the camera pulls back to frame the whole env grid, and on a
         # generated rough terrain that puts the ground tens of metres away. With a 30 m far plane
         # everything but the sky got clipped, and the stream showed a gradient over nothing.
@@ -72,10 +93,17 @@ def _set_pose(cam, eye, target, device, n):
     )
 
 
-def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
-                    key: str = DEFAULT_KEY, secret: str = DEFAULT_SECRET, fps: int = 15):
-    import omni.kit.app
+def start_publisher(
+    env,
+    room: str = DEFAULT_ROOM,
+    url: str = DEFAULT_URL,
+    key: str = DEFAULT_KEY,
+    secret: str = DEFAULT_SECRET,
+    fps: int = 15,
+):
     from livekit import api, rtc
+
+    import omni.kit.app
 
     if not key or not secret:
         # Say so and carry on: --stream is a convenience, and losing the training run because the
@@ -101,7 +129,7 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
     pano_target = (center + torch.tensor([0.0, 0.0, 0.15], device=device)).tolist()
     try:
         _set_pose(pano_cam, pano_eye, pano_target, device, n)
-        print(f"[livekit] camera ready, panorama eye={[round(x,2) for x in pano_eye]}", flush=True)
+        print(f"[livekit] camera ready, panorama eye={[round(x, 2) for x in pano_eye]}", flush=True)
     except Exception as e:  # noqa: BLE001
         print("[livekit] failed to set camera pose:", e, flush=True)
 
@@ -111,8 +139,8 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
     # smooth the motion so resets do not yank the camera. Scenes without a "robot" articulation
     # keep the static grid framing.
     robot = unwrapped.scene.articulations.get("robot")
-    _MAX_VIEW_SPAN = 18.0   # metres of robot spread the view will try to contain
-    _EMA = 0.05             # per-tick smoothing; ~1.3 s to settle at 15 fps
+    _MAX_VIEW_SPAN = 18.0  # metres of robot spread the view will try to contain
+    _EMA = 0.05  # per-tick smoothing; ~1.3 s to settle at 15 fps
     _follow = {"c": None, "s": None}
 
     def _follow_cam():
@@ -129,9 +157,7 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
         dd = ss * 0.65 + 2.0
         eye = cs + torch.tensor([0.0, -dd, dd * 0.85 + 1.5], device=device)
         tgt = cs + torch.tensor([0.0, 0.0, 0.15], device=device)
-        pano_cam.set_world_poses_from_view(
-            eyes=eye.unsqueeze(0).repeat(n, 1), targets=tgt.unsqueeze(0).repeat(n, 1)
-        )
+        pano_cam.set_world_poses_from_view(eyes=eye.unsqueeze(0).repeat(n, 1), targets=tgt.unsqueeze(0).repeat(n, 1))
 
     # "sub" holds the update subscription: dropping the handle would let it be collected and the
     # capture callback would stop firing.
@@ -160,8 +186,9 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
         except Exception:  # noqa: BLE001
             pass
 
-    shared["sub"] = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(
-        _on_update, name="livekit-capture")
+    shared["sub"] = (
+        omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(_on_update, name="livekit-capture")
+    )
 
     def _lk_thread():
         loop = asyncio.new_event_loop()
@@ -170,7 +197,8 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
         async def run():
             token = (
                 api.AccessToken(key, secret)
-                .with_identity("isaac-train").with_name("Isaac Training")
+                .with_identity("isaac-train")
+                .with_name("Isaac Training")
                 .with_grants(api.VideoGrants(room_join=True, room=room, can_publish=True, can_subscribe=False))
                 .to_jwt()
             )
@@ -179,11 +207,14 @@ def start_publisher(env, room: str = DEFAULT_ROOM, url: str = DEFAULT_URL,
             src_p = rtc.VideoSource(PANO_W, PANO_H)
             await r.local_participant.publish_track(
                 rtc.LocalVideoTrack.create_video_track("pano", src_p),
-                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA))
+                rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_CAMERA),
+            )
             print(f"[livekit] publishing training video to room '{room}'", flush=True)
             while True:
                 if shared["pano"] is not None:
-                    src_p.capture_frame(rtc.VideoFrame(PANO_W, PANO_H, rtc.VideoBufferType.RGBA, shared["pano"].tobytes()))
+                    src_p.capture_frame(
+                        rtc.VideoFrame(PANO_W, PANO_H, rtc.VideoBufferType.RGBA, shared["pano"].tobytes())
+                    )
                 await asyncio.sleep(period)
 
         try:

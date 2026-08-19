@@ -1,0 +1,7 @@
+# Dependency tarballs fetched by `helm dependency update`. Chart.lock pins the exact versions
+# and digest, so these are reproducible artifacts rather than sources — CI refetches them before
+# packaging (docker/publish_charts.sh does it).
+#
+# NOT in .helmignore: `helm package` must include them, or the packaged chart cannot render its
+# dependency at install time.
+charts/

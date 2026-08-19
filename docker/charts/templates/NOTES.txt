@@ -1,0 +1,121 @@
+{{- $fullname := include "isaaclab.fullname" . -}}
+{{- $render := eq (include "isaaclab.isRender" .) "true" -}}
+Isaac Lab is deployed as {{ $fullname }} in namespace {{ .Release.Namespace }}, in {{ .Values.mode }} mode.
+
+Pod:     {{ $fullname }}-0
+Storage: data-{{ $fullname }}-0 ({{ .Values.persistence.size }}, {{ .Values.persistence.storageClass }}) at {{ .Values.persistence.mountPath }}
+{{- if $render }}
+Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
+{{- end }}
+
+{{- if and $render (eq .Values.streaming.loadBalancer.addressType "PUBLIC") }}
+
+⚠️ THIS SESSION IS ON THE PUBLIC INTERNET, UNAUTHENTICATED
+  Isaac Sim's WebRTC endpoint authenticates nobody — there is no password step to fail. Anyone
+  who learns the address can drive this session: build, simulate, watch.
+{{- if .Values.streaming.exposeNvcfPort }}
+  Port {{ .Values.streaming.nvcfPort }} is published too, which is worse: it serves unauthenticated
+  asset conversion taking arbitrary file paths, and session termination. Turn off
+  streaming.exposeNvcfPort unless a client actually needs it.
+{{- end }}
+  Restrict it at the network layer — a CLB ACL or a security group rule allowing only the source
+  addresses that should reach it. The chart cannot do this for you. Or use
+  streaming.loadBalancer.addressType=PRIVATE and reach it over a bastion or VPN.
+{{- end }}
+
+{{- with (include "isaaclab.hardware.warning" . | trim) }}
+
+⚠️ HARDWARE WARNING
+  {{ . }}
+{{- end }}
+
+1. Wait for the pod:
+
+     kubectl rollout status statefulset/{{ $fullname }} -n {{ .Release.Namespace }}
+
+{{- if $render }}
+{{- if .Values.streaming.publicEndpoint }}
+
+2. Isaac Sim starts on its own and advertises {{ .Values.streaming.publicEndpoint }}, which you
+   set explicitly. Point a WebRTC streaming client at:
+
+     {{ .Values.streaming.publicEndpoint }}:{{ .Values.streaming.signallingPort }}
+
+   ⚠️ Make sure that address really reaches this pod. It is advertised to clients verbatim and
+   is never verified — a wrong one fails as a black screen, not an error.
+{{- else }}
+
+2. Get the address the stream is published on:
+
+     kubectl get svc {{ include "isaaclab.streamServiceName" . }} -n {{ .Release.Namespace }} \
+       -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+   The pod discovers this by itself — nothing needs to be configured. To confirm it did:
+
+     kubectl logs {{ $fullname }}-0 -n {{ .Release.Namespace }} -c wait-clb-ip
+
+   Point a WebRTC streaming client at that address on port {{ .Values.streaming.signallingPort }}.
+{{- if .Values.streaming.loadBalancer.create }}
+
+   ⚠️ Check the bandwidth on that CLB's public IP in the console. The chart asked for
+   {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps, but the platform echoes the request
+   back whether or not it honoured it, so kubectl cannot tell you. The default it falls back to
+   is 1 Mbps, which cannot carry video — the stream connects and then stalls.
+{{- end }}
+{{- end }}
+
+3. Watch Isaac Sim start. It runs in the foreground, so its log is the container log:
+
+     kubectl logs -f {{ $fullname }}-0 -n {{ .Release.Namespace }}
+
+   The UDP media port ({{ .Values.streaming.mediaPort }}) is bound lazily, at session setup. It
+   stays absent until the first client connects — that is expected. To check it once connected,
+   without any tools in the image:
+
+     kubectl exec {{ $fullname }}-0 -n {{ .Release.Namespace }} -- \
+       sh -c 'grep -i ":$(printf %04X {{ .Values.streaming.mediaPort }}) " /proc/net/udp'
+
+   ⚠️ If signalling connects but the picture never arrives, try the native streaming client or
+   Firefox before suspecting the network: Chrome and Safari have a known issue with Isaac Sim
+   running in a container.
+{{- else }}
+
+2. Exec in and launch training:
+
+     kubectl exec -it {{ $fullname }}-0 -n {{ .Release.Namespace }} -- bash
+
+   Nothing is exposed in train mode, by design. Write checkpoints and logs under
+   {{ .Values.persistence.mountPath }} so they survive the pod.
+{{- $lkurl := include "isaaclab.stream.url" . }}
+{{- if .Values.livekit.enabled }}
+
+3. A LiveKit server was deployed with this release. Get the address viewers connect to:
+
+     kubectl get svc {{ include "isaaclab.livekit.serviceName" . }} -n {{ .Release.Namespace }} \
+       -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+   ⚠️ THIS SERVER IS SHARED. Point other training releases at it with:
+
+     --set stream.url={{ $lkurl }}
+
+   and leave livekit.enabled=false on those. Uninstalling THIS release stops the server for every
+   run still publishing to it. The CLB and its public address survive
+   {{- if .Values.livekit.service.keepOnUninstall }} (service.keepOnUninstall is on){{ else }} only if service.keepOnUninstall is turned on — it is currently OFF, so the address would be lost{{ end }}.
+
+4. Publish a training view to it by adding --stream to a run:
+
+     ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
+       --task <task> --num_envs 16 --headless --stream
+
+   It publishes to room {{ include "isaaclab.stream.room" . }}. Demo use — keep num_envs small.
+
+   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
+      A run using it belongs on an instance type valid for BOTH modes.
+{{- else if $lkurl }}
+
+3. Training can publish a live view to {{ $lkurl }} (room {{ include "isaaclab.stream.room" . }})
+   by adding --stream to a run. That server is NOT managed by this release.
+
+   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
+{{- end }}
+{{- end }}

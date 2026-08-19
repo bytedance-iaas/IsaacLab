@@ -1,0 +1,197 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+{{- include "isaaclab.validate" . }}
+{{- $render := eq (include "isaaclab.isRender" .) "true" }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "isaaclab.fullname" . }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "isaaclab.fullname" . }}
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "isaaclab.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "isaaclab.selectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "isaaclab.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Always
+
+      {{- if and $render (not .Values.streaming.publicEndpoint) }}
+      # Discovers the address to advertise to WebRTC clients. The load balancer's VIP is written
+      # back onto the Service by the cloud controller; this reads it from the API and leaves it
+      # where the entrypoint looks. Nobody has to know an IP at deploy time, and because the VIP
+      # belongs to the Service rather than the pod, it stays the same across pod replacement.
+      #
+      # Skipped entirely when streaming.publicEndpoint is set explicitly.
+      initContainers:
+        - name: wait-clb-ip
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              API=https://kubernetes.default.svc
+              SA=/var/run/secrets/kubernetes.io/serviceaccount
+              SVC={{ include "isaaclab.streamServiceName" . }}
+              URL="$API/api/v1/namespaces/$(cat $SA/namespace)/services/$SVC"
+              for i in $(seq 1 {{ .Values.streaming.loadBalancer.waitAttempts }}); do
+                IP=$(wget -q -O - --no-check-certificate \
+                      --header "Authorization: Bearer $(cat $SA/token)" "$URL" \
+                      | grep -o '"ip"[[:space:]]*:[[:space:]]*"[0-9.]*"' \
+                      | head -1 | cut -d'"' -f4 || true)
+                if [ -n "${IP:-}" ]; then
+                  echo "$IP" > /shared/public_ip
+                  echo "[wait-clb-ip] load balancer address = $IP"
+                  exit 0
+                fi
+                # Probe once, early, to tell "no permission" apart from "not ready yet" -- the
+                # two look identical from here, and only one of them is worth waiting out.
+                if [ "$i" = "3" ] && ! wget -q -O /dev/null --no-check-certificate \
+                     --header "Authorization: Bearer $(cat $SA/token)" "$URL"; then
+                  echo "[wait-clb-ip] WARNING: cannot read Service $SVC from the API server." >&2
+                  echo "  Waiting will not help. Check the ServiceAccount and Role." >&2
+                fi
+                echo "[wait-clb-ip] no address yet ($i/{{ .Values.streaming.loadBalancer.waitAttempts }}), waiting..."
+                sleep 5
+              done
+              echo "[wait-clb-ip] the load balancer never got an address." >&2
+              echo "  Check: kubectl describe svc $SVC" >&2
+              echo "  A subnetId outside this cluster's VPC is the usual cause." >&2
+              exit 1
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      {{- end }}
+
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # `args`, never `command`: the image ENTRYPOINT is tini (PID 1, reaps what Isaac Sim
+          # re-parents), and a pod-level command: would replace it and drop tini.
+          {{- if $render }}
+          args: ["/usr/local/bin/start-workstation.sh"]
+          {{- else }}
+          # Idles until you exec in and launch training by hand.
+          args: ["sleep", "infinity"]
+          {{- end }}
+          env:
+            {{- with .Values.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- if $render }}
+            - name: ISAACSIM_SIGNALLING_PORT
+              value: {{ .Values.streaming.signallingPort | quote }}
+            - name: ISAACSIM_MEDIA_PORT
+              value: {{ .Values.streaming.mediaPort | quote }}
+            {{- with .Values.streaming.publicEndpoint }}
+            - name: ISAACSIM_PUBLIC_ENDPOINT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- else }}
+            {{/*
+            Where `train.py --stream` publishes its view. Only set when there is something to
+            point at; otherwise livekit_stream.py falls back to its own compiled-in default.
+            */}}
+            {{- with (include "isaaclab.stream.url" .) }}
+            - name: LIVEKIT_URL
+              value: {{ . | quote }}
+            {{- end }}
+            - name: LIVEKIT_ROOM
+              value: {{ include "isaaclab.stream.room" . | quote }}
+            {{- with (include "isaaclab.stream.secretName" .) }}
+            # LiveKit's own `keys` format ("api_key: api_secret"), read straight from the Secret
+            # the server itself uses. livekit_stream.py accepts this form precisely so that one
+            # credential serves both ends: a second copy in another shape would be free to drift,
+            # and the failure mode is a connection that authenticates and then fails.
+            # optional, because --stream is a convenience and its credentials must never be able
+            # to stop a training run from starting.
+            - name: LIVEKIT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: keys
+                  optional: true
+            {{- end }}
+            {{- end }}
+          {{- with .Values.envFromSecrets }}
+          envFrom:
+            {{- range . }}
+            # optional: a missing Secret must not block startup.
+            - secretRef: { name: {{ . | quote }}, optional: true }
+            {{- end }}
+          {{- end }}
+          {{- if $render }}
+          ports:
+            - name: signalling
+              containerPort: {{ .Values.streaming.signallingPort }}
+              protocol: TCP
+            - name: nvcf-http
+              containerPort: {{ .Values.streaming.nvcfPort }}
+              protocol: TCP
+            - name: media
+              containerPort: {{ .Values.streaming.mediaPort }}
+              protocol: UDP
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.persistence.mountPath | quote }}
+            - name: dshm
+              mountPath: /dev/shm
+            {{- if $render }}
+            - name: shared
+              mountPath: /shared
+            {{- end }}
+
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.dshmSize | quote }}
+        {{- if $render }}
+        # Carries the discovered address from the init container to the entrypoint.
+        - name: shared
+          emptyDir: {}
+        {{- end }}
+
+  # Binds an existing data-<release>-<ordinal> PVC if there is one and only creates it
+  # otherwise, so checkpoints survive a reinstall. IMMUTABLE after creation: changing size or
+  # storageClass fails the upgrade.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        storageClassName: {{ .Values.persistence.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}

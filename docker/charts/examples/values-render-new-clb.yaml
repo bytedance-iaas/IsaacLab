@@ -1,0 +1,61 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+# Isaac Sim workstation, streamed over WebRTC, on a NEWLY PROVISIONED load balancer.
+#
+#   helm install isaaclab-render ./docker/charts \
+#     -f docker/charts/examples/values-render-new-clb.yaml \
+#     --set image.tag=<tag>
+#
+# Use this for a fresh environment. The CLB is created with the release, and its address is
+# discovered by the pod — nothing has to be looked up or configured first.
+#
+# ⚠️ The CLB is DELETED with the release, and its address goes with it: a reinstall comes back on
+#    a different one. Once people have that address, switch to values-render-existing-clb.yaml so
+#    it survives.
+#
+# Values below are for the Volcengine test cluster; adjust for anywhere else.
+
+mode: render
+
+image:
+  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab
+  tag: ""
+
+# Rendering needs a GPU with a display engine and an NVENC encoder — not every GPU node has
+# them, and one that lacks them starts Isaac Sim but never produces a picture. ecs.gna3c.7xlarge
+# (L20) is the type this has been verified on.
+nodeSelector:
+  node.kubernetes.io/instance-type: ecs.gna3c.7xlarge
+
+resources:
+  requests: { cpu: "8", memory: 64Gi, nvidia.com/gpu: "1" }
+  limits:   { cpu: "32", memory: 256Gi, nvidia.com/gpu: "1" }
+
+persistence:
+  storageClass: ebs-essd
+  size: 500Gi
+  mountPath: /data
+
+dshmSize: 16Gi
+
+streaming:
+  loadBalancer:
+    # Provision a new CLB with this release.
+    create: true
+    # ⚠️ PUBLIC, and deliberately so: this example is the test cluster, reached from outside
+    #    the VPC. It publishes an UNAUTHENTICATED Isaac Sim session — anyone who learns the
+    #    address can drive it, since the endpoint has no password step at all.
+    #    Put a CLB ACL or security group rule in front of it allowing only the addresses that
+    #    should reach it. The chart default is PRIVATE; this file overrides it on purpose.
+    addressType: PUBLIC
+    # Empty lets the platform choose. If the CLB never gets an address, a subnet outside this
+    # cluster's VPC is the usual cause — set it explicitly then.
+    subnetId: ""
+
+# Only ecs.gna3c.7xlarge is confirmed so far; extend as more are validated.
+hardware:
+  renderInstanceTypes:
+    - ecs.gna3c.7xlarge

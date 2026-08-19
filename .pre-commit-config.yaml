@@ -21,6 +21,10 @@ repos:
       - id: check-added-large-files
         args: ["--maxkb=2000"]  # restrict files more than 2 MB. Should use git-lfs instead.
       - id: check-yaml
+        # Helm templates are Go templates that merely end in .yaml: `{{ ... }}` standing where a
+        # value or a whole block belongs is not valid YAML and never parses. `helm lint` is what
+        # checks these, and docker/publish_charts.sh runs it for both chart modes before packaging.
+        exclude: ^docker/charts/templates/
       - id: check-merge-conflict
       - id: check-case-conflict
       - id: check-executables-have-shebangs

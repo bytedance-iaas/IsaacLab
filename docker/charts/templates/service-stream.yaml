@@ -1,0 +1,80 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+{{/*
+The load balancer that carries the WebRTC stream, and the source of the address Isaac Sim
+advertises to clients. Render mode only.
+
+⚠️ THE PORTS MUST MAP 1:1 (port == targetPort). Isaac Sim writes these port numbers into the
+SDP alongside the public address, so a rewritten port makes the advertised endpoint wrong and
+the client connects to nothing. Mapping them 1:1 is also why publicEndpointPort never has to be
+set on the Isaac Sim side.
+
+externalTrafficPolicy is left at the default (Cluster). Measured on Volcengine CLB: a single
+five-tuple lands consistently on one backend node, so the source address ICE sees does not move
+mid-session. The cost is SNAT -- Isaac Sim sees a node's internal IP rather than the real client
+address. Switching to Local removes the SNAT and a hop, but changes how CLB health checks pick
+backends and needs re-validating; the default is the one that has been proven here.
+*/}}
+{{- if eq (include "isaaclab.isRender" .) "true" }}
+{{- $lb := .Values.streaming.loadBalancer }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "isaaclab.streamServiceName" . }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+  annotations:
+    service.beta.kubernetes.io/volcengine-loadbalancer-address-type: {{ $lb.addressType | quote }}
+    {{- if not $lb.create }}
+    # Reuse an existing CLB rather than provisioning one. The controller binds this Service to
+    # that instance instead of creating another, so the address stays the one already in use.
+    service.beta.kubernetes.io/volcengine-loadbalancer-id: {{ $lb.existingId | quote }}
+    {{- end }}
+    {{- with $lb.subnetId }}
+    service.beta.kubernetes.io/volcengine-loadbalancer-subnet-id: {{ . | quote }}
+    {{- end }}
+    {{- if $lb.create }}
+    {{- with $lb.bandwidthMbps }}
+    # Public bandwidth cap. The platform default is 1 Mbps, which cannot carry video -- the stream
+    # connects and then stalls, which reads as a broken stream rather than a capped link.
+    # Both documented spellings are sent: the CCM echoes annotations back whether or not it
+    # understands them, so neither could be confirmed from the outside. Setting both is harmless.
+    service.beta.kubernetes.io/volcengine-loadbalancer-bandwidth: {{ . | quote }}
+    service.beta.kubernetes.io/volcengine-loadbalancer-eip-bandwidth: {{ . | quote }}
+    {{- end }}
+    {{- with $lb.eipBillingType }}
+    service.beta.kubernetes.io/volcengine-loadbalancer-eip-billing-type: {{ . | quote }}
+    {{- end }}
+    {{- end }}
+    {{- with $lb.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  type: LoadBalancer
+  selector:
+    {{- include "isaaclab.selectorLabels" . | nindent 4 }}
+  ports:
+    # WebRTC signalling. What the streaming client is pointed at.
+    - name: signalling
+      port: {{ .Values.streaming.signallingPort }}
+      targetPort: {{ .Values.streaming.signallingPort }}
+      protocol: TCP
+    {{- if .Values.streaming.exposeNvcfPort }}
+    # HTTP API of the omni.services.livestream.nvcf extension.
+    # ⚠️ 15 unauthenticated endpoints, including arbitrary-path asset conversion and session
+    # termination. Off by default; see streaming.exposeNvcfPort in values.yaml.
+    - name: nvcf-http
+      port: {{ .Values.streaming.nvcfPort }}
+      targetPort: {{ .Values.streaming.nvcfPort }}
+      protocol: TCP
+    {{- end }}
+    # WebRTC media. Bound lazily by Isaac Sim at session setup, so it stays absent from
+    # /proc/net/udp until the first client connects -- that is expected, not a fault.
+    - name: media
+      port: {{ .Values.streaming.mediaPort }}
+      targetPort: {{ .Values.streaming.mediaPort }}
+      protocol: UDP
+{{- end }}
