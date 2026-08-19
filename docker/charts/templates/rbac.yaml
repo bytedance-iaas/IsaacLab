@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 {{/*
 Lets the init container read back the address assigned to this release's load balancer Service.
 Render mode only, and skipped when the address is supplied explicitly -- then nothing reads the

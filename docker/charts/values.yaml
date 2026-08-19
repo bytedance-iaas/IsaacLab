@@ -1,3 +1,8 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
 # Defaults are installable-anywhere, not tuned for any one cluster: training mode, no node pin,
 # no image tag and no load balancer. The image serves two different workloads and `mode` picks
 # which one this release runs.
