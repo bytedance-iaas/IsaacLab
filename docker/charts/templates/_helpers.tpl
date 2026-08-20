@@ -160,6 +160,41 @@ failure -- the whole framework simply vanishes from the image -- so it is reject
 
 {{- include "isaaclab.streaming.validate" . }}
 {{- include "isaaclab.livekit.validate" . }}
+{{- include "isaaclab.viewer.validate" . }}
+{{- end }}
+
+{{/*
+The viewer is published to the internet by default, so its password is not optional and neither
+is the Secret holding it. Everything here fails rendering rather than starting an open page that
+lists every running training and plays it.
+*/}}
+{{- define "isaaclab.viewer.validate" -}}
+{{- if .Values.viewer.enabled }}
+{{- if not .Values.livekit.enabled }}
+{{- fail "viewer.enabled=true requires livekit.enabled=true: the viewer signs its tokens with the LiveKit server's Secret, so there is nothing to sign for without a server. To watch a server owned by another release, deploy the viewer from that release instead." }}
+{{- end }}
+{{- if not .Values.viewer.image.tag }}
+{{- fail "viewer.image.tag is required when viewer.enabled=true. The viewer image is built and released separately from the training image, so it has its own tag." }}
+{{- end }}
+{{- if not .Values.viewer.auth.existingSecret }}
+{{- fail "viewer.auth.existingSecret is required. The viewer is published with HTTP Basic authentication in front of it and there is no way to turn that off -- a page that enumerates every running training and plays it must not be open. Create the Secret first, in the release namespace:\n  kubectl create secret generic physical-ai-auth -n <namespace> --from-literal=username=<user> --from-literal=password='<password>'\nThe chart deliberately cannot create it from values, because Helm keeps values in the release history where the password would stay readable." }}
+{{- end }}
+{{- if or (not .Values.viewer.auth.usernameKey) (not .Values.viewer.auth.passwordKey) }}
+{{- fail "viewer.auth.usernameKey and viewer.auth.passwordKey are both required." }}
+{{- end }}
+{{- if eq .Values.viewer.auth.usernameKey .Values.viewer.auth.passwordKey }}
+{{- fail "viewer.auth.usernameKey and viewer.auth.passwordKey must be different." }}
+{{- end }}
+{{- if not (has .Values.viewer.service.type (list "LoadBalancer" "ClusterIP")) }}
+{{- fail (printf "viewer.service.type must be \"LoadBalancer\" or \"ClusterIP\", got %q." .Values.viewer.service.type) }}
+{{- end }}
+{{- if and (eq .Values.viewer.service.type "LoadBalancer") (not (has .Values.viewer.service.addressType (list "PUBLIC" "PRIVATE"))) }}
+{{- fail (printf "viewer.service.addressType must be \"PUBLIC\" or \"PRIVATE\", got %q." .Values.viewer.service.addressType) }}
+{{- end }}
+{{- if hasPrefix "https://" .Values.viewer.publicLivekitUrl }}
+{{- fail "viewer.publicLivekitUrl is a LiveKit signalling URL, not a web address: use ws:// or wss://." }}
+{{- end }}
+{{- end }}
 {{- end }}
 
 {{/*

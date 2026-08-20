@@ -246,8 +246,14 @@ stream:
   # nothing.
   url: ""
 
-  # Room name. One room per run keeps two people training at the same time out of each other's
-  # video. Empty derives it from the release name.
+  # Room name. Empty is the right default: the chart then supplies JOB_NAME (the pod name) instead
+  # and livekit_stream.py derives train-$JOB_NAME, which keeps the decision as close to the run as
+  # a deployment can put it. Set this only to pin every run on this release into one named room.
+  #
+  # ⚠️ Leaving it empty does NOT give you one room per run. replicas is 1, so the pod name is
+  #    effectively the release name, and two runs started by hand in the SAME pod still publish
+  #    into the same room and overwrite each other. Fixing that needs the room name to carry
+  #    something only the run knows -- the task, a timestamp -- which lives in livekit_stream.py.
   room: ""
 
   # Secret holding the LiveKit credentials, in LiveKit's own `keys` format (`api_key: api_secret`).
@@ -318,6 +324,87 @@ livekit:
 # If a release is meant to both train and render on one node, the instance type must appear in
 # BOTH lists — the intersection is the only hardware that can do both.
 # ---------------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------------------------
+# STREAM VIEWER — the page people open to watch a training run
+# ---------------------------------------------------------------------------------------------
+#
+# A small web service (viewer/ in this repository) that lists the rooms currently being published
+# to and plays one in the browser. Viewers never handle a LiveKit key: the backend holds the
+# credential and signs a short-lived, read-only, single-room token for each page.
+#
+# Tied to livekit.enabled, because it signs those tokens with the LiveKit server's own Secret —
+# without a server there is nothing to sign for and nothing to watch.
+#
+# ⚠️ Its image is built and released SEPARATELY from the training image. That one is ~8.5 GB and
+#    this one is a slim Python base with no dependencies; a wording change on the page must not
+#    rebuild the training image, and the two move on different schedules.
+viewer:
+  # Requires livekit.enabled=true.
+  enabled: false
+
+  image:
+    repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab-viewer
+    # REQUIRED when enabled, and empty for the same reason as the training image: the chart does
+    # not track image versions.
+    tag: ""
+    pullPolicy: IfNotPresent
+
+  # Container port. Must match what the viewer image serves on (its Dockerfile sets PORT=8080).
+  port: 8080
+
+  # HTTP Basic authentication. REQUIRED — the chart refuses to render without it.
+  #
+  # This page is the one thing in the whole deployment that is meant to be opened by a person, so
+  # it is the one thing that gets published to the internet by default. That only holds up if it
+  # authenticates, and a page that lists every running training and plays it is a worse thing to
+  # leave open than a port nobody knows the shape of. There is deliberately no "off" switch.
+  #
+  # Create the Secret first, in the release namespace:
+  #
+  #   kubectl create secret generic physical-ai-auth -n <namespace> \
+  #     --from-literal=username=<user> --from-literal=password='<password>'
+  #
+  # The chart cannot create it from values: Helm stores values verbatim in the release history,
+  # where anyone who can run `helm get values` would read the password back.
+  #
+  # ⚠️ The variable names below are the contract with viewer/server.py. If that file reads
+  #    different names, these must change with it or the page comes up unauthenticated.
+  auth:
+    existingSecret: physical-ai-auth
+    usernameKey: username
+    passwordKey: password
+
+  service:
+    # LoadBalancer publishes the page; ClusterIP keeps it to port-forward only.
+    type: LoadBalancer
+    # PUBLIC is the default here, unlike the render stream — this page has a password in front of
+    # it and is meant to be opened from a browser. PRIVATE if you would rather reach it through a
+    # bastion or put your own gateway in front.
+    addressType: PUBLIC
+    port: 80
+    subnetId: ""
+    bandwidthMbps: 10
+    annotations: {}
+    waitAttempts: 120
+
+  # The address the PAGE uses to reach LiveKit, as opposed to the in-cluster one the backend uses.
+  # Empty derives the LiveKit load balancer's public VIP at runtime, which is almost always right.
+  #
+  # ⚠️ The two must be different. A browser cannot resolve an in-cluster Service name, and sending
+  #    the backend out to the public VIP pays for a round trip and egress to reach a pod beside it.
+  #
+  # ⚠️ Set this to a wss:// URL once LiveKit terminates TLS. Until then the page must be opened
+  #    over http: a https page is not allowed to open a plaintext ws:// connection, so an https
+  #    page against a ws:// LiveKit connects to nothing.
+  publicLivekitUrl: ""
+
+  # How long a viewer's token stays valid, seconds.
+  tokenTtl: 3600
+
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+
 hardware:
   # The nodeSelector key that carries the instance type. Only used to find the value to check.
   instanceTypeKey: node.kubernetes.io/instance-type

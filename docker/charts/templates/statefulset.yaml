@@ -123,8 +123,25 @@ spec:
             - name: LIVEKIT_URL
               value: {{ . | quote }}
             {{- end }}
+            {{/*
+            The room a run publishes into. Deliberately NOT pinned by default: livekit_stream.py
+            falls back to train-$JOB_NAME, so leaving LIVEKIT_ROOM unset and supplying JOB_NAME
+            puts the decision as close to the run as the deployment can get it.
+
+            ⚠️ This is necessary but NOT sufficient for "one room per run". replicas is 1, so the
+            pod name is effectively the release name, and two runs started by hand in the SAME pod
+            still collide. Separating those needs the room name to carry something only the run
+            knows -- the task, a timestamp -- which is a change in livekit_stream.py, not here.
+            */}}
+            {{- with .Values.stream.room }}
             - name: LIVEKIT_ROOM
-              value: {{ include "isaaclab.stream.room" . | quote }}
+              value: {{ . | quote }}
+            {{- else }}
+            - name: JOB_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- end }}
             {{- with (include "isaaclab.stream.secretName" .) }}
             # LiveKit's own `keys` format ("api_key: api_secret"), read straight from the Secret
             # the server itself uses. livekit_stream.py accepts this form precisely so that one
