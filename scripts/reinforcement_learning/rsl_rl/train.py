@@ -212,7 +212,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Stream: one reset to populate the camera buffers, then publishing runs alongside training.
     if args_cli.stream:
         env.reset()
-        livekit_stream.start_publisher(env)
+        livekit_stream.start_publisher(env, task=args_cli.task)
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":

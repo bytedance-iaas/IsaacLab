@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import threading
 import time
 
@@ -53,8 +54,32 @@ if not DEFAULT_KEY:
         _key, _, _secret = _keys.splitlines()[0].partition(":")
         DEFAULT_KEY, DEFAULT_SECRET = _key.strip(), _secret.strip()
 
-# One room per run, so two people training at the same time do not land in each other's video.
-DEFAULT_ROOM = os.environ.get("LIVEKIT_ROOM") or f"train-{os.environ.get('JOB_NAME', 'local')}"
+
+def default_room(task: str | None = None) -> str:
+    """One room per run, so two trainings at the same time do not land in each other's video.
+
+    The deployment can only contribute JOB_NAME, which identifies the pod -- and a single-replica
+    StatefulSet has one pod, so two runs started by hand inside it would collide. The task and the
+    start time are known only here, and they are also what makes the room recognisable in a viewer's
+    list: "Velocity-Rough-G1 at 14:32" rather than a pod name repeated three times.
+    """
+    if os.environ.get("LIVEKIT_ROOM"):
+        return os.environ["LIVEKIT_ROOM"]
+    parts = ["train"]
+    if task:
+        # Isaac-Velocity-Rough-G1-v0 -> Velocity-Rough-G1: the prefix and version are on every task
+        # and carry nothing that tells two rooms apart.
+        short = re.sub(r"^Isaac-|-v\d+$", "", task)
+        parts.append(re.sub(r"[^A-Za-z0-9]+", "-", short).strip("-"))
+    job = os.environ.get("JOB_NAME", "").strip()
+    if job:
+        parts.append(job)
+    parts.append(time.strftime("%H%M%S"))
+    # Room names travel in URLs and tokens; keep them within a sane length.
+    return "-".join(p for p in parts if p)[:64]
+
+
+DEFAULT_ROOM = default_room()
 
 PANO_W, PANO_H = 960, 540  # panorama resolution
 
@@ -95,12 +120,17 @@ def _set_pose(cam, eye, target, device, n):
 
 def start_publisher(
     env,
-    room: str = DEFAULT_ROOM,
+    room: str | None = None,
     url: str = DEFAULT_URL,
     key: str = DEFAULT_KEY,
     secret: str = DEFAULT_SECRET,
     fps: int = 15,
+    task: str | None = None,
 ):
+    # Resolved here rather than as a default argument: the task is only known at the call site, and
+    # a default would have frozen the start time at import.
+    room = room or default_room(task)
+
     from livekit import api, rtc
 
     import omni.kit.app
