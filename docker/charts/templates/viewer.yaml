@@ -1,0 +1,253 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+{{/*
+The page people open to watch a training run. Lists the rooms currently being published to and
+plays one; viewers never hold a LiveKit key, because the backend signs a short-lived, read-only,
+single-room token for each page.
+
+Requires livekit.enabled: the tokens are signed with that server's Secret, and the backend reads
+the SAME Secret object rather than a copy -- two copies of a credential drift, and the failure
+mode is a page that authenticates and then cannot join.
+
+Published with HTTP Basic authentication in front of it, always. This is the one component meant
+to be opened by a person, so it is the one that defaults to PUBLIC -- which only holds up because
+the password is mandatory. A page that enumerates every running training and plays it is a worse
+thing to leave open than a port whose protocol nobody knows.
+*/}}
+{{/* Validate first: without it, a viewer enabled against no LiveKit fails on a missing subchart
+     value and reports a template line number instead of the reason. */}}
+{{- include "isaaclab.validate" . }}
+{{- if .Values.viewer.enabled }}
+{{- $name := printf "%s-viewer" (include "isaaclab.fullname" .) }}
+{{- $v := .Values.viewer }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+  {{- if eq $v.service.type "LoadBalancer" }}
+  annotations:
+    service.beta.kubernetes.io/volcengine-loadbalancer-address-type: {{ $v.service.addressType | quote }}
+    {{- with $v.service.subnetId }}
+    service.beta.kubernetes.io/volcengine-loadbalancer-subnet-id: {{ . | quote }}
+    {{- end }}
+    {{- with $v.service.bandwidthMbps }}
+    {{/* Same reasoning as the stream's CLB: the platform default of 1 Mbps is not enough, and
+         both documented spellings are sent because the CCM echoes annotations it does not
+         understand. See the chart README. */}}
+    service.beta.kubernetes.io/volcengine-loadbalancer-bandwidth: {{ . | quote }}
+    service.beta.kubernetes.io/volcengine-loadbalancer-eip-bandwidth: {{ . | quote }}
+    {{- end }}
+    {{- with $v.service.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+spec:
+  type: {{ $v.service.type }}
+  selector:
+    app: {{ $name }}
+  ports:
+    - name: http
+      port: {{ $v.service.port }}
+      targetPort: {{ $v.port }}
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app: {{ $name }}
+    spec:
+      {{- if not $v.publicLivekitUrl }}
+      serviceAccountName: {{ $name }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if not $v.publicLivekitUrl }}
+      {{/*
+      The page needs an address a BROWSER can reach, which is the LiveKit load balancer's public
+      VIP -- unknown at render time, because the CLB is created by this same install. Read it from
+      the API at startup, exactly as the stream and LiveKit itself do.
+
+      Uses the LiveKit image rather than the viewer's: the viewer base is python:3.11-slim with no
+      wget or curl, and this is the same script already proven on the other two.
+      */}}
+      initContainers:
+        - name: wait-clb-ip
+          image: "{{ .Values.livekit.image.repository }}:{{ .Values.livekit.image.tag }}"
+          imagePullPolicy: {{ .Values.livekit.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              API=https://kubernetes.default.svc
+              SA=/var/run/secrets/kubernetes.io/serviceaccount
+              SVC={{ include "isaaclab.livekit.serviceName" . }}
+              URL="$API/api/v1/namespaces/$(cat $SA/namespace)/services/$SVC"
+              for i in $(seq 1 {{ $v.service.waitAttempts }}); do
+                IP=$(wget -q -O - --no-check-certificate \
+                      --header "Authorization: Bearer $(cat $SA/token)" "$URL" \
+                      | grep -o '"ip"[[:space:]]*:[[:space:]]*"[0-9.]*"' \
+                      | head -1 | cut -d'"' -f4 || true)
+                if [ -n "${IP:-}" ]; then
+                  echo "$IP" > /shared/livekit_ip
+                  echo "[wait-clb-ip] LiveKit address for the page = $IP"
+                  exit 0
+                fi
+                if [ "$i" = "3" ] && ! wget -q -O /dev/null --no-check-certificate \
+                     --header "Authorization: Bearer $(cat $SA/token)" "$URL"; then
+                  echo "[wait-clb-ip] WARNING: cannot read Service $SVC from the API server." >&2
+                  echo "  Waiting will not help. Check the ServiceAccount and Role." >&2
+                fi
+                echo "[wait-clb-ip] no address yet ($i/{{ $v.service.waitAttempts }}), waiting..."
+                sleep 5
+              done
+              echo "[wait-clb-ip] the LiveKit load balancer never got an address." >&2
+              echo "  Set viewer.publicLivekitUrl to skip this lookup." >&2
+              exit 1
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+      {{- end }}
+
+      containers:
+        - name: viewer
+          image: "{{ $v.image.repository }}:{{ $v.image.tag }}"
+          imagePullPolicy: {{ $v.image.pullPolicy }}
+          {{- if not $v.publicLivekitUrl }}
+          {{/* Wraps the image's own CMD so the discovered address reaches server.py, which reads
+               configuration from the environment and knows nothing about Kubernetes. */}}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              export LIVEKIT_PUBLIC_URL="ws://$(cat /shared/livekit_ip):{{ .Values.livekit.service.ports.signal }}"
+              echo "[viewer] page will connect to $LIVEKIT_PUBLIC_URL"
+              exec python3 -u server.py
+          {{- end }}
+          env:
+            - name: PORT
+              value: {{ $v.port | quote }}
+            - name: TOKEN_TTL
+              value: {{ $v.tokenTtl | quote }}
+            {{/* Where the BACKEND reaches LiveKit: in-cluster, so it does not leave the cluster
+                 to talk to a pod beside it. */}}
+            - name: LIVEKIT_URL
+              value: {{ printf "ws://%s.%s.svc.cluster.local:%v" (include "isaaclab.livekit.serviceName" .) .Release.Namespace .Values.livekit.service.ports.signal | quote }}
+            {{/* Where the PAGE reaches LiveKit. A browser cannot resolve the name above, so this
+                 has to be an address reachable from outside the cluster. Empty means "discover
+                 the LiveKit load balancer's VIP at runtime", which the init container does. */}}
+            {{- with $v.publicLivekitUrl }}
+            - name: LIVEKIT_PUBLIC_URL
+              value: {{ . | quote }}
+            {{- end }}
+            {{/* The LiveKit server's own Secret, in LiveKit's `keys` format. Same object the
+                 server reads. */}}
+            - name: LIVEKIT_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "isaaclab.livekit.secretName" . }}
+                  key: keys
+            {{/* HTTP Basic credentials. NOT optional: a missing Secret must stop the pod rather
+                 than quietly publish an open page. The names are the contract with
+                 viewer/server.py. */}}
+            - name: VIEWER_AUTH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $v.auth.existingSecret }}
+                  key: {{ $v.auth.usernameKey | quote }}
+            - name: VIEWER_AUTH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $v.auth.existingSecret }}
+                  key: {{ $v.auth.passwordKey | quote }}
+          ports:
+            - name: http
+              containerPort: {{ $v.port }}
+              protocol: TCP
+          {{/* /healthz has to stay outside the authenticated area or these probes fail on 401. */}}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            {{- toYaml $v.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          {{- if not $v.publicLivekitUrl }}
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          {{- end }}
+      {{- if not $v.publicLivekitUrl }}
+      volumes:
+        - name: shared
+          emptyDir: {}
+      {{- end }}
+{{- if not $v.publicLivekitUrl }}
+---
+{{/*
+Lets the viewer read the LiveKit load balancer's public VIP, so the page can be told an address a
+browser can actually reach. Only rendered when that address was not supplied explicitly.
+
+Same shape as the stream's RBAC: one verb, one resource, pinned by name to a single Service.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    resourceNames: [{{ include "isaaclab.livekit.serviceName" . | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "isaaclab.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+{{- end }}
+{{- end }}
