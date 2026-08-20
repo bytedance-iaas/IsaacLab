@@ -6,8 +6,10 @@
 FROM hub-cache-cn-beijing.cr.volces.com/library/python:3.11-slim
 
 WORKDIR /app
-COPY server.py .
-COPY static/ ./static/
+# Paths are relative to the repository root: CI builds with the root as the context, the same as
+# docker/Dockerfile does.
+COPY viewer/server.py .
+COPY viewer/static/ ./static/
 
 ENV PORT=8080
 EXPOSE 8080
