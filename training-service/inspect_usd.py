@@ -1,9 +1,12 @@
-"""Inspect an uploaded USD for sufficient physics information and report readable findings.
+"""Inspect a USD for sufficient physics information and report readable findings.
+
+Written for the person about to reference an asset from a task they are writing by hand: the
+report carries the measured bounding box, which is where the poses and the geometry-derived
+reward thresholds in the env cfg come from, and it says which physics the asset is missing.
 
 Uses a standalone usd-core (an independent pxr) instead of starting the Isaac Sim app, which is
 fast (~1s) and reliable. usd-core is installed in /opt/usd-core (see the Dockerfile) for this
 script alone, so it does not pollute the training environment.
-The API calls this after an upload and echoes the messages back to the frontend.
 
 Usage: python inspect_usd.py <usd_path> [out.json]
   The report is printed as a single "__USD_REPORT__ <json>" line and optionally written to out.json.

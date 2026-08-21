@@ -1,118 +1,64 @@
 # training-service
 
-A config-driven training layer for Isaac Lab. The user, or the frontend on their behalf, fills in a
-single YAML request and never touches the command line or Python.
-
-**Robot- and task-agnostic**: adding a robot or a task only touches `profiles/`; `schema.py` and
-`launcher.py` stay unchanged.
-
-## Layout
+Scripts that run alongside training: publishing the live view, turning a finished run into a
+readable report, archiving what it produced, and measuring an asset before you write a task around
+it. Each is a standalone command; nothing here orchestrates anything.
 
 ```
 training-service/
-├── schema.py            # request schema + validation
-├── launcher.py          # read request -> validate -> build Hydra command -> run (supports --dry-run)
-├── profiles/
-│   ├── robots.yaml      # robot catalog: robot -> supported tasks (task ids) + DR capability (true/false/builtin)
-│   └── tasks/           # task-type profiles (robot-agnostic)
-│       ├── reach.yaml   #   goal_zones / behavior_presets / dr_off_overrides
-│       ├── lift.yaml
-│       └── velocity.yaml
-└── example_request.yaml # example request (what the frontend produces)
+├── livekit_stream.py   # --stream on train.py publishes the training view here
+├── make_report.py      # finished run -> report.md (all hyperparameters + derived metrics)
+├── upload_tos.py       # upload a run directory to TOS, preserving structure
+└── inspect_usd.py      # measure a USD and check whether it carries physics
 ```
 
-- **robots.yaml** answers "which robot can do which tasks, and does it have domain randomization".
-- **tasks/&lt;task&gt;.yaml** answers "what can be tuned for this task" — spatial ranges, behavior
-  presets, and how to neutralize DR.
-- Robots and tasks are decoupled: one reach profile serves SO-ARM, Franka and UR; only the task id
-  differs.
+## livekit_stream.py
 
-## Currently supported
+Not run by hand. `train.py --stream` imports it, adds a camera that follows the robots, and
+publishes one video track to LiveKit for the browser viewer (`viewer/`). Credentials and the
+server address come from the environment, which the Helm chart fills in; without them training
+runs normally and simply publishes nothing.
 
-| Robot | Tasks | DR | Status |
-|-------|-------|----|--------|
-| SO-ARM100 / 101 | reach, lift | switchable (added by us) | ✅ training verified |
-| Franka Panda | reach, lift | none | reach verified; lift is structurally identical |
-| UR10 | reach | none | same structure as Franka reach |
-| Anymal-C | velocity (locomotion) | built in | ✅ verified |
-
-## Usage
+## make_report.py
 
 ```bash
-# inside the image, at /workspace/isaaclab/training-service
-../isaaclab.sh -p launcher.py --config request.yaml            # validate and start training
-../isaaclab.sh -p launcher.py --config request.yaml --dry-run  # print the command only
+./isaaclab.sh -p training-service/make_report.py --latest
 ```
 
-A backend can also call `launcher.build_command(req)` directly, or validate first with
-`schema.validate(req)`, which raises `ValidationError` carrying a user-readable message.
+Reads the TensorBoard log and the saved `params/` of a run and writes `report.md` into the run
+directory: every hyperparameter that was actually in effect, plus derived quantities (reward per
+step, update-to-data ratio, the trend over the last stretch). It states measurements and draws no
+conclusions, which is deliberate — the report is meant to be pasted whole into an AI assistant and
+asked what looks wrong.
 
-## Worked example: launching a training run
+`--latest` picks the most recent run, so there is no timestamp to copy.
 
-Say the goal is a precise SO-ARM101 pick-and-place policy, with real-robot robustness on, at the
-standard budget.
-
-**Step 1 — get the request YAML.** Either configure it in the console and copy the YAML, or write it
-by hand:
-
-```yaml
-# my_pick.yaml
-robot: so101
-task: lift
-training_budget: standard      # quick | standard | thorough
-behavior: precise              # balanced | precise | smooth
-sim2real_robustness: true
-seed: 42
-output_name: pick_v1
-goal:
-  object_start_zone: {x: [-0.08, 0.08], y: [-0.15, 0.15]}
-  target_zone:       {x: [0.15, 0.30], y: [-0.15, 0.15], z: [0.10, 0.25]}
-```
-
-**Step 2 — start training:**
+## upload_tos.py
 
 ```bash
-kubectl exec -it isaaclab -n default -- bash
-cd /workspace/isaaclab/training-service
-../isaaclab.sh -p launcher.py --config my_pick.yaml            # run it
-# ../isaaclab.sh -p launcher.py --config my_pick.yaml --dry-run  # inspect the command first
+./isaaclab.sh -p training-service/upload_tos.py --local-dir <run 目录> --prefix <前缀>
 ```
 
-The launcher validates the request (for example, whether the object range leaves the workspace),
-looks up `robots.yaml` and `tasks/lift.yaml`, assembles the full command — task id
-`Isaac-SO-ARM101-Lift-Cube-v0`, `--num_envs 4096`,
-`env.rewards.object_goal_tracking_fine_grained.weight=10.0`, the range overrides — and runs it. **The
-user never sees a task id, a Hydra path, or a reward term name.**
+Walks the directory and uploads it to TOS with the structure intact, over the internal endpoint so
+it costs no public traffic. Credentials come from the pod environment; without them it prints one
+line and skips rather than failing the job.
 
-**Step 3 — artifacts:** checkpoints land in `logs/rsl_rl/lift/<timestamp>/model_*.pt`.
+⚠️ `--local-dir` is not optional in practice: without it the default is the whole `logs/` tree,
+which means uploading every run this pod has ever done.
 
-### With and without training-service
+## inspect_usd.py
 
-| | Without | With |
-|---|---|---|
-| What the user writes | a long command carrying task ids, Hydra paths and reward names | one plain-language YAML |
-| On mistakes | a wrong path silently trains the wrong thing | out-of-range values and unsupported combinations are **rejected up front** with an explanation |
-| Switching robots | edit many parameters | edit one line, `robot:` |
+```bash
+_isaac_sim/kit/python/bin/python3 training-service/inspect_usd.py <path.usd>
+```
 
-> Note: this runs inside the pod, so training is tied to the exec session (foreground). With the API
-> in front of it, a run can be started from the browser as a background K8s Job.
+One second, no Isaac Sim. Reports the measured bounding box, whether the asset carries a rigid
+body, collision geometry and mass, and whether the scale looks like it is in the wrong unit.
 
-## DR / sim2real behavior
+Useful when writing a task by hand: the bounding box is where the poses and the geometry-derived
+reward thresholds come from. In the lift task, for instance, `minimal_height: 0.025` follows from
+a 3 cm cube resting with its centre at 1.5 cm — swap the object and that number no longer means
+"lifted", so the measurement has to come first.
 
-- `dr: true` (SO-ARM) — the sim2real switch is effective; when turned off the launcher neutralizes
-  the DR terms using the task profile's `dr_off_overrides`.
-- `dr: false` (Franka, UR) — the task has no DR wired up, so the switch is ignored and no
-  `dr_off` overrides are emitted.
-- `dr: builtin` (Anymal velocity) — the task ships its own DR and it is always on.
-
-## Adding a robot or a task
-
-- **Add a robot**: another entry in `robots.yaml` (name / group / dr / tasks).
-- **Add a task type**: another profile under `tasks/` (goal_zones / behavior_presets /
-  dr_off_overrides). If the task is manager-based and needs a sim2real switch, also add
-  randomization events to its `EventCfg` — see `deploy/reach` or the velocity tasks for reference.
-
-## Calibrating the budget tiers (TODO)
-
-The `num_envs` / `max_iterations` values in `schema.py:BUDGET_PRESETS` are estimates. They should be
-calibrated against measured wall-clock time on the target GPU.
+Runs against a standalone usd-core in `/opt/usd-core`, kept out of the training environment's own
+pxr.
