@@ -28,6 +28,10 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--stream", action="store_true", default=False,
+    help="Publish the training view to LiveKit for live viewing in a browser. Demo only; keep num_envs small (~16).",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -37,8 +41,8 @@ cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
-if args_cli.video:
+# always enable cameras to record video / livekit stream
+if args_cli.video or args_cli.stream:
     args_cli.enable_cameras = True
 
 # clear out sys.argv for Hydra
@@ -171,6 +175,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.log_dir = log_dir
 
     # create isaac environment
+    # Stream: the camera has to exist before the env is built, so add it here. Skipped entirely
+    # without --stream, which keeps a run that does not stream byte-for-byte unchanged.
+    if args_cli.stream:
+        sys.path.insert(0, "/workspace/isaaclab/training-service")
+        import livekit_stream
+
+        livekit_stream.add_stream_camera(env_cfg)
+
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
     # convert to single-agent instance if required by the RL algorithm
@@ -195,6 +207,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+    # Stream: one reset to populate the camera buffers, then publishing runs alongside training.
+    if args_cli.stream:
+        env.reset()
+        livekit_stream.start_publisher(env, task=args_cli.task)
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
