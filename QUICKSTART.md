@@ -109,13 +109,12 @@ setsid nohup ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/play.py --ta
 
 # 三、改参数(全部免代码)
 
-三层机制,按需选一层:
+两种写法,按参数性质选:
 
-| 层 | 写在哪 | 校验 |
+| 写法 | 用在哪 | 写错了会怎样 |
 |---|---|---|
-| 结构化字段 | 训练请求 yaml(走 launcher 时) | ✅ 提交时报人话 |
-| Hydra override | yaml 的 `advanced.overrides` 或命令行尾部 | 启动时报错,不静默 |
-| 命令行旗标 | `--num_envs` / `--max_iterations` / `--seed` | argv 优先级最高 |
+| Hydra override | 命令行尾部,如 `agent.algorithm.gamma=0.99` | 启动时报错,指出是哪个键,不会静默 |
+| 命令行旗标 | `--num_envs` / `--max_iterations` / `--seed` | 优先级最高,写成 override 会被静默覆盖 |
 
 **参数名从哪查**:每次训练的 run 目录自动保存 `params/agent.yaml`(算法超参)和 `params/env.yaml`(环境参数),**里面的树形路径逐级用点连起来就是 override 语法**:
 
@@ -156,7 +155,8 @@ setsid nohup ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --t
 **不选 SAC 的场景:**
 
 - **简单任务(平地等)**:实测 PPO 26 分钟收敛且质量相当,SAC 反而慢(单轮计算更重:网络更大、三个 optimizer、UTD 高)。
-- **操作类任务(机械臂 reach/lift)**:本仓库设计上仅支持 PPO(profiles 里 `algorithms` 未含 sac 的机器人选 SAC 会在提交时被拒)。
+- **操作类任务(机械臂 reach/lift)**:只有 PPO 配置。上游 Isaac Lab 和 ETH 论文都没有操作类的
+  SAC 超参可参照,自行调一组也无从验证对错,因此不提供。
 - **需要断点续训的长任务**:off-policy 续训尚不支持(replay buffer 不落盘,恢复即冷启动退化)。
 
 **资源注意**:replay buffer 在 GPU 上全额预分配(观测存两份)。参考:8192 env + 5M buffer ≈ 占满 A30(24G)的 80%;显存小的卡按比例降 `replay_buffer_size` 或 `num_envs`。
