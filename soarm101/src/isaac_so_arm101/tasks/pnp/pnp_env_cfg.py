@@ -1,4 +1,4 @@
-"""SO-101 pick-and-place: drop a red cube into a bin standing on the table.
+"""SO-101 pick-and-place: drop a cube into a bin standing on the table.
 
 Translated by hand from a scene authored in the Isaac Sim GUI (so101_pnp.usd), and written to be
 read as an example of that translation. A scene file carries geometry; a task also needs intent,
@@ -10,30 +10,59 @@ Measured off the scene and the assets it references:
   ThorlabsTable   bbox x=[-0.1762, 0.7238]  y=[-0.3793, 0.3793]  z=[-0.7947, 0]
                   -> work surface sits exactly at z = 0, footprint 0.90 x 0.76
   DexCube         0.06 across, scaled 0.5 in the GUI scene -> a 3 cm cube
-  Bin, cube, robot poses  read from the scene, then adjusted as described below
+  Poses           robot and table both at the origin (the scene authors no transform on either),
+                  cube at (0.20, 0, 0.015), bin at (0.18, -0.18, 0)
 
-Decided, because the scene cannot express it:
+Those poses are worth dwelling on, because they fix the frame everything else is written in: the
+robot sits at the origin and the work is at +X, which is exactly where the stock SO_ARM101_CFG
+already rests the arm. Keep that frame and the arm faces its work on the first frame for free.
 
-  * Table placement. The GUI put the table at the origin, which buries the robot in the middle of
-    it. The table is 0.90 x 0.76 while the arm works in about a 0.25 m square, so it is positioned
-    to centre the span that is actually in play rather than to sit flush with anything.
-  * Rest pose. The stock SO_ARM101_CFG rests with the arm stretched along +X, which here points
-    away from both the cube and the bin. A quarter turn of the base has it face the work area from
-    the first frame. The sign of that turn is not derivable from the scene and the first guess was
-    wrong -- check it against the simulated body position, not the USD transform, which stays at
-    the authored pose no matter how the joints move.
-  * Two props rebuilt from primitives instead of referenced: DexCube is blue and this task wants
-    red; small_KLT is grey and ships a DomeLight inside it, which would be cloned into every
-    parallel environment and wash out the scene.
+A warning attached to that, because it is the trap this file fell into and cost the most to find.
+An asset's prim origin is not its geometric centre. ThorlabsTable's footprint centre is offset
+(0.274, 0) from its own origin, so "table at the origin" does NOT mean "table centred on the
+robot" -- it means the robot stands 0.18 m in from the near edge, which is a sensible mount. An
+earlier version of this file assumed origin == centre, concluded the robot was buried mid-table,
+translated the table to "fix" it, re-laid the props around the new centre (rotating the work area
+to -Y), and then added a base-rotation override so the arm would face the props it had just moved.
+Four edits, none of which errored, all undoing a problem that never existed. The bounding box
+recorded a few lines above disproved the assumption the whole time.
+
+So: measure the asset, then reason from the measurement, not from what the placement looks like it
+implies. If a scene seems to need fixing before it can be translated, suspect the reading first.
+
+Every pose here is the authored one, and both props keep the authored asset or its measured
+dimensions, so a viewer watching the training stream sees the scene that was built, not a
+rearrangement of it. Three things still had to be decided, and each has a reason the scene file
+could not carry:
+
+  * The cube became a distribution instead of a pose. A scene file holds one arrangement; a policy
+    handed one pose memorises one reach. The authored (0.20, 0) is now the centre of a patch, sized
+    by what the arm can reach and by keeping clear of the bin. Bounds are in EventCfg.
+  * The bin is rebuilt from primitives at small_KLT's measured footprint instead of referencing it.
+    Two reasons, and the second is the interesting one. First, the asset carries a DomeLight, which
+    would be cloned into every parallel environment. Second, the crate is a shallow tray: 0.0585
+    tall at the scene's 0.4 scale, with a floor about 2 mm thick. Drop a 3 cm cube into it and the
+    cube settles at z = 0.0170, against 0.0150 for the same cube on the bare table -- "in the bin"
+    is 2 mm different from "on the table", and both are under the 0.025 that object_is_lifted calls
+    "lifted". That threshold also gates object_goal_distance, so referencing the asset as-is would
+    drive 36 of the 37 total reward weight to zero at the exact moment the cube lands in the bin.
+    Nothing errors; the run simply never learns to finish. The rebuild keeps the footprint and the
+    colour and raises the floor to 20 mm.
   * Reward thresholds derived from geometry, e.g. "lifted" at 0.025 m because a 3 cm cube resting
     on the table has its centre at 0.015 m. Swap the cube for a taller object and that number
     silently stops meaning "lifted" -- it would already be true at rest.
 
+Also worth knowing when comparing against the GUI: the scene places small_KLT at z = 0, and that
+asset's origin is its centre, so in the authored file the bin sits 29.3 mm into the tabletop -- the
+same origin-is-not-the-centre trap as the table, in a place where it is genuinely hard to see. It
+does not look wrong in a render, because the sunken half is hidden by the table; it just reads as a
+shallower crate. Here the bin is placed on the surface instead.
+
 Inherited: rewards, terminations and observations come from the lift task's mdp package, so this
 file defines a scene and a goal, not new learning code.
 
-Scope: everything here is local to this task. The robot rest pose is overridden on this task's own
-scene config, so the stock reach and lift tasks are untouched.
+Scope: everything here is local to this task. Nothing shared is modified -- the robot config is
+used exactly as it ships, so the stock reach and lift tasks are untouched.
 """
 
 from __future__ import annotations
@@ -63,45 +92,53 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 # Layout constants -- every number is either measured or derived from a measurement
 ##
 
-# The table is much larger (0.90 x 0.76) than the area the arm actually works in, so it is placed
-# to centre that area rather than to sit flush with the robot: everything in play spans from the
-# robot at y = 0 to the far edge of the bin near y = -0.25, and centring that span on the table
-# leaves roughly equal margins front and back instead of a crowded corner and an empty acre.
-TABLE_POS = (-0.274, -0.125, 0.0)
+# Table and robot both sit at the origin, as the scene authored them. The asset's footprint
+# centre is offset (0.274, 0) from its own origin, so the tabletop runs x = -0.176 .. 0.724,
+# y = +-0.379: the arm is mounted 0.18 m in from the near edge and works down the table's length.
+TABLE_POS = (0.0, 0.0, 0.0)
 
-# Centre of the tabletop once shifted: the asset's own footprint centre is
-# (0.274, 0.0), so it lands at (0.0, -0.125). Used by the collision slab below.
-TABLE_TOP_XY = (0.0, -0.125)
+# Centre of the tabletop in world coordinates. Used by the collision slab below.
+TABLE_TOP_XY = (0.274, 0.0)
 TABLE_TOP_T = 0.02
 
 CUBE_SIZE = 0.03  # DexCube is 0.06 and the GUI scene scaled it by 0.5
-# Front-left of the robot, clear of the bin: the cube is what the arm reaches for, so it must not
-# start where the cube is supposed to end up.
-CUBE_INIT = (-0.16, -0.12, CUBE_SIZE / 2)
 
-# Bin: outer 0.16 x 0.13, walls 8 mm, floor 20 mm.
-# The floor is deliberately thick: a cube resting inside sits at
-# z = 0.020 + 0.015 = 0.035, which clears the 0.025 "is lifted" threshold, so
-# the goal reward stays alive once the cube is actually in the bin.
-# Directly in front of the robot: the arm faces -Y, so keeping the bin on x = 0 puts the drop
-# target straight ahead instead of off to one side.
-BIN_XY = (0.0, -0.22)
+# The cube keeps its authored pose (0.20, 0), which is also, exactly, where the stock lift task
+# puts its cube -- good evidence the scene was built from that task. A scene file can only hold one
+# arrangement, though, and a policy handed one pose memorises one reach, so the authored pose
+# becomes the centre of a patch and EventCfg jitters within it.
+CUBE_INIT = (0.20, 0.0, CUBE_SIZE / 2)
+CUBE_JITTER_X = 0.04
+CUBE_JITTER_Y = 0.06
+
+# Bin: authored pose, and an outer footprint matching small_KLT at the scene's 0.4 scale
+# (measured: 0.079 x 0.119 x 0.059).
+BIN_XY = (0.18, -0.18)
+BIN_WALL_T = 0.006
+BIN_INNER_HX = 0.0335   # -> outer 0.079 across X
+BIN_INNER_HY = 0.0535   # -> outer 0.119 across Y
+BIN_OUT_X = 2 * (BIN_INNER_HX + BIN_WALL_T)
+BIN_OUT_Y = 2 * (BIN_INNER_HY + BIN_WALL_T)
+BIN_WALL_H = 0.045
+
+# The one dimension that does NOT come from the asset, and the reason the bin is rebuilt from
+# primitives rather than referenced. small_KLT is 0.0585 tall at this scale and its floor is barely
+# 2 mm thick: dropping a 3 cm cube into it, sat flat on the table, settles the cube at z = 0.0170
+# (measured) against 0.0150 for the same cube on the bare table. Both are under the 0.025 that
+# object_is_lifted calls "lifted", and that threshold also gates object_goal_distance, so 36 of the
+# 37 total reward weight would fall to zero at the exact moment the cube lands in the bin --
+# silently, with nothing in the logs but a policy that never finishes the task.
+# A 20 mm floor puts a resting cube at 0.035 and keeps the reward alive.
 BIN_FLOOR_T = 0.020
-BIN_WALL_T = 0.008
-BIN_WALL_H = 0.055
-BIN_INNER_HX = 0.072
-BIN_INNER_HY = 0.057
 
 # Where the cube ends up once it is sitting on the bin floor.
 GOAL_Z = BIN_FLOOR_T + CUBE_SIZE / 2
 
-# Base rotation that turns the arm from its stock +X rest pose toward the work area at -Y.
-# Sign verified against the simulated gripper position: -1.5708 swings it to +Y, the wrong way.
-REST_PAN = 1.5708
-
-COLOUR_CUBE = (0.85, 0.10, 0.10)   # red
-COLOUR_BIN_OUT = (0.04, 0.04, 0.04)  # black outside
-COLOUR_BIN_IN = (0.95, 0.95, 0.95)   # white inside
+# Sampled from small_KLT's own diffuse texture (FOF_Map_Magenta_Box_D.png): mean (130, 84, 118),
+# dominant (141, 88, 131). The rebuilt bin is plain where the real crate is ribbed, but at the
+# distance the training view is watched from, colour is what tells you it is the same bin.
+COLOUR_BIN_OUT = (0.44, 0.25, 0.40)
+COLOUR_BIN_IN = (0.50, 0.31, 0.46)
 
 
 def _wall(name: str, dx: float, dy: float, sx: float, sy: float) -> AssetBaseCfg:
@@ -133,21 +170,12 @@ def _wall(name: str, dx: float, dy: float, sx: float, sy: float) -> AssetBaseCfg
 class PnPSceneCfg(InteractiveSceneCfg):
     """Table with a bin on it, plus the robot and the cube it has to move."""
 
-    # Rest pose, overridden here rather than in SO_ARM101_CFG: the shared config starts the arm
-    # stretched along +X, which in this scene points away from both the cube and the bin, so every
-    # reset shows the arm facing the wrong way before it swings around. A quarter turn of the base
-    # has it face the work area from the first frame. Keeping the override local leaves the stock
-    # reach and lift tasks exactly as they were.
-    robot: ArticulationCfg = SO_ARM101_CFG.replace(
-        prim_path="{ENV_REGEX_NS}/Robot",
-        init_state=ArticulationCfg.InitialStateCfg(
-            rot=(1.0, 0.0, 0.0, 0.0),
-            joint_pos={**SO_ARM101_CFG.init_state.joint_pos, "shoulder_pan": REST_PAN},
-            joint_vel={".*": 0.0},
-        ),
-    )
+    # Stock config, unmodified: it rests the arm stretched along +X, which is where the scene
+    # author put the work -- so the arm faces the bin and the cube from the first frame with no
+    # override needed.
+    robot: ArticulationCfg = SO_ARM101_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
-    # White table with a dark frame -- kept as the GUI authored it, only moved.
+    # White table with a dark frame -- exactly as the GUI authored it, at the origin.
     table = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Table",
         init_state=AssetBaseCfg.InitialStateCfg(pos=TABLE_POS),
@@ -174,23 +202,25 @@ class PnPSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/BinFloor",
         init_state=AssetBaseCfg.InitialStateCfg(pos=(BIN_XY[0], BIN_XY[1], BIN_FLOOR_T / 2)),
         spawn=sim_utils.CuboidCfg(
-            size=(0.16, 0.13, BIN_FLOOR_T),
+            size=(BIN_OUT_X, BIN_OUT_Y, BIN_FLOOR_T),
             collision_props=sim_utils.CollisionPropertiesCfg(),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=COLOUR_BIN_IN, roughness=0.5),
         ),
     )
 
-    bin_wall_px = _wall("PX", +(BIN_INNER_HX + BIN_WALL_T / 2), 0.0, BIN_WALL_T, 0.114)
-    bin_wall_nx = _wall("NX", -(BIN_INNER_HX + BIN_WALL_T / 2), 0.0, BIN_WALL_T, 0.114)
-    bin_wall_py = _wall("PY", 0.0, +(BIN_INNER_HY + BIN_WALL_T / 2), 0.16, BIN_WALL_T)
-    bin_wall_ny = _wall("NY", 0.0, -(BIN_INNER_HY + BIN_WALL_T / 2), 0.16, BIN_WALL_T)
+    bin_wall_px = _wall("PX", +(BIN_INNER_HX + BIN_WALL_T / 2), 0.0, BIN_WALL_T, BIN_OUT_Y)
+    bin_wall_nx = _wall("NX", -(BIN_INNER_HX + BIN_WALL_T / 2), 0.0, BIN_WALL_T, BIN_OUT_Y)
+    bin_wall_py = _wall("PY", 0.0, +(BIN_INNER_HY + BIN_WALL_T / 2), BIN_OUT_X, BIN_WALL_T)
+    bin_wall_ny = _wall("NY", 0.0, -(BIN_INNER_HY + BIN_WALL_T / 2), BIN_OUT_X, BIN_WALL_T)
 
-    # Red cube, built from a primitive so the colour and size are exact.
+    # The cube the scene actually references, at the scale the scene actually used, so what the
+    # training stream shows is the object from the scene rather than a look-alike.
     object = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
         init_state=RigidObjectCfg.InitialStateCfg(pos=CUBE_INIT, rot=(1.0, 0.0, 0.0, 0.0)),
-        spawn=sim_utils.CuboidCfg(
-            size=(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE),
+        spawn=UsdFileCfg(
+            usd_path=f"{ISAAC_NUCLEUS_DIR}/Props/Blocks/DexCube/dex_cube_instanceable.usd",
+            scale=(0.5, 0.5, 0.5),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 solver_position_iteration_count=16,
                 solver_velocity_iteration_count=1,
@@ -201,9 +231,8 @@ class PnPSceneCfg(InteractiveSceneCfg):
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=0.05),
             collision_props=sim_utils.CollisionPropertiesCfg(),
-            # A small gripper needs grip: stock friction lets the cube squirt out.
-            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.2, dynamic_friction=1.0),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=COLOUR_CUBE, roughness=0.5),
+            # Nothing else is overridden: appearance and surface properties are DexCube's own,
+            # which is the point of referencing the asset instead of rebuilding it.
         ),
     )
 
@@ -303,13 +332,22 @@ class ObservationsCfg:
 class EventCfg:
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
 
-    # Kept tight: the lift task jitters by +-0.1/0.2, which here would drop the
-    # cube off the table edge or straight into the bin.
+    # The cube starts somewhere in a 0.08 x 0.12 patch centred on its authored pose, so the policy
+    # has to look at where it is instead of memorising one reach. The bounds come from two limits:
+    # centres run x = 0.16 .. 0.24, y = -0.06 .. 0.06, which keeps every start between 0.16 and
+    # 0.25 m from the base -- inside the range the scene itself uses -- and leaves 4.5 cm between
+    # the cube and the near bin wall.
+    # Widening this is the first thing to check if the cube ever spawns inside the bin or out of
+    # reach -- the lift task's own +-0.1/0.2 would do both here.
     reset_object_position = EventTerm(
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {"x": (-0.04, 0.04), "y": (-0.04, 0.04), "z": (0.0, 0.0)},
+            "pose_range": {
+                "x": (-CUBE_JITTER_X, CUBE_JITTER_X),
+                "y": (-CUBE_JITTER_Y, CUBE_JITTER_Y),
+                "z": (0.0, 0.0),
+            },
             "velocity_range": {},
             "asset_cfg": SceneEntityCfg("object", body_names="Object"),
         },
@@ -373,7 +411,7 @@ class CurriculumCfg:
 
 @configclass
 class SoArm101PnPEnvCfg(ManagerBasedRLEnvCfg):
-    """SO-101 puts a red cube into a bin on the table."""
+    """SO-101 puts a cube into a bin on the table."""
 
     scene: PnPSceneCfg = PnPSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: ObservationsCfg = ObservationsCfg()

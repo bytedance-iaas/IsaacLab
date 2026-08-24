@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""SO-101 pick-and-place: put a red cube into a bin standing on the table.
+"""SO-101 pick-and-place: put a cube into a bin standing on the table.
 
 The scene was authored in the Isaac Sim GUI and translated into config here;
 poses and dimensions come from measuring the real assets. See pnp_env_cfg.
