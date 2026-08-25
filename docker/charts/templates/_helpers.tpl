@@ -58,52 +58,23 @@ both can exist; the init container looks this one up by name.
 {{- printf "%s-stream" (include "isaaclab.fullname" .) }}
 {{- end }}
 {{/*
-Object names belonging to the `livekit` DEPENDENCY. That chart derives them from its own
-nameOverride (falling back to the release name), so these must follow the same rule -- and it is
-why this chart pins livekit.nameOverride to a fixed value rather than letting it default.
+The LiveKit signalling port, read back out of stream.url so there is no second value to disagree
+with it. stream.url is validated to carry a port, so `last` is a port and not a hostname.
 */}}
-{{- define "isaaclab.livekit.name" -}}
-{{- default .Release.Name .Values.livekit.nameOverride }}
-{{- end }}
-
-{{- define "isaaclab.livekit.serviceName" -}}
-{{- printf "%s-clb" (include "isaaclab.livekit.name" .) }}
-{{- end }}
-
-{{- define "isaaclab.livekit.secretName" -}}
-{{- printf "%s-auth" (include "isaaclab.livekit.name" .) }}
+{{- define "isaaclab.stream.port" -}}
+{{- .Values.stream.url | splitList ":" | last }}
 {{- end }}
 
 {{/*
-Where the training publisher sends its video.
-
-Explicit stream.url wins. Otherwise, if this release brings up a server, address that one
-in-cluster -- the publisher runs inside the cluster, so routing out to the public VIP and back
-would be a hairpin paying for a round trip and egress for nothing. With neither, this is empty
-and the publisher falls back to the default compiled into livekit_stream.py.
+Where the publisher sends its video, and the Secret it authenticates with. Empty when streaming is
+off, which is what drops LIVEKIT_URL and LIVEKIT_KEYS from the pod.
 */}}
 {{- define "isaaclab.stream.url" -}}
-{{- if .Values.stream.url }}
 {{- .Values.stream.url }}
-{{- else if .Values.livekit.enabled }}
-{{- printf "ws://%s.%s.svc.cluster.local:%v" (include "isaaclab.livekit.serviceName" .) .Release.Namespace .Values.livekit.service.ports.signal }}
-{{- end }}
 {{- end }}
 
-{{/*
-The Secret the publisher reads its credentials from. Defaults to the one the dependency creates,
-so both ends read the SAME object -- two copies of one credential drift, and the failure mode is
-a connection that authenticates and then fails.
-
-It holds LiveKit's own `keys` format rather than split variables, which livekit_stream.py accepts
-for exactly this reason.
-*/}}
 {{- define "isaaclab.stream.secretName" -}}
-{{- if .Values.stream.existingSecret }}
 {{- .Values.stream.existingSecret }}
-{{- else if .Values.livekit.enabled }}
-{{- include "isaaclab.livekit.secretName" . }}
-{{- end }}
 {{- end }}
 
 {{- define "isaaclab.stream.room" -}}
@@ -111,23 +82,47 @@ for exactly this reason.
 {{- end }}
 
 {{/*
-Only the combinations this chart is responsible for. auth.keys and service.subnetId are the
-dependency's own required values and it fails on them itself; repeating those checks here would
-mean maintaining the same rule in two charts.
+LiveKit is OPTIONAL for training, and required only by the viewer.
+
+A training run reaches LiveKit through `train.py --stream`, which most runs do not use -- so a
+train release that names no server is a perfectly ordinary headless deployment and installs
+without complaint. Name one and the address and credentials are wired into the pod; leave it empty
+and they are not, and `--stream` falls back to whatever livekit_stream.py was built against.
+
+The viewer is where it stops being optional: it lists the rooms on a LiveKit server and signs each
+page a token with that server's own Secret, so it has nothing to show and nothing to sign with
+unless a server is named. That check lives in isaaclab.viewer.validate.
 */}}
-{{- define "isaaclab.livekit.validate" -}}
-{{- if .Values.livekit.enabled }}
+{{- define "isaaclab.stream.validate" -}}
+
+{{/* LiveKit is the TRAINING view; the render path streams over its own WebRTC endpoint and never
+     reads these, so a value here would be read by nobody while looking deliberate. */}}
 {{- if eq .Values.mode "render" }}
-{{- fail "livekit.enabled=true with mode=render: LiveKit carries the training view (train.py --stream), while mode=render streams the interactive Isaac Sim session over its own WebRTC endpoint. LiveKit relays one-way video and cannot carry input back, so it cannot stand in for the render path. Deploy the LiveKit server from a train-mode release." }}
+{{- if or .Values.stream.url .Values.stream.existingSecret }}
+{{- fail "stream.url / stream.existingSecret do not apply when mode=render, and are rejected rather than ignored: the render path streams over its own WebRTC endpoint (streaming.loadBalancer) and never reads them. LiveKit carries the TRAINING view — it relays one-way video and cannot carry input back, so the two are not interchangeable either way round." }}
 {{- end }}
+{{- end }}
+
+{{/* Both or neither. One alone is a half-configured publisher: an address with no credentials
+     authenticates against nothing, and credentials with no address go to the compiled-in
+     default -- each looks configured and neither works. */}}
+{{- if and .Values.stream.url (not .Values.stream.existingSecret) }}
+{{- fail "stream.url is set but stream.existingSecret is empty. The publisher needs both: the address to reach LiveKit, and the Secret to authenticate with — which must be the SAME object the server itself reads, or the two ends authenticate against different keys and every connection fails after appearing to succeed." }}
+{{- end }}
+{{- if and .Values.stream.existingSecret (not .Values.stream.url) }}
+{{- fail "stream.existingSecret is set but stream.url is empty. Without an address the publisher falls back to the one compiled into livekit_stream.py, so the credentials here would be used against a server nobody chose. Set stream.url to the in-cluster address of the LiveKit server, e.g. ws://livekit-clb.<namespace>.svc.cluster.local:7880." }}
+{{- end }}
+
+{{/* Validated because the chart reads the PORT back out of it for the viewer's page: a URL
+     without one yields a hostname where a port belongs, and the page loads and never connects. */}}
 {{- if .Values.stream.url }}
-{{- fail "stream.url must be empty when livekit.enabled=true: this release brings up its own server and the chart addresses it in-cluster. Set stream.url only to publish to a server owned by another release (with livekit.enabled=false)." }}
-{{- end }}
-{{- if .Values.stream.existingSecret }}
-{{- fail "stream.existingSecret must be empty when livekit.enabled=true: the publisher reads the Secret the dependency creates, so that both ends share one credential. Set it only when publishing to a server owned by another release." }}
+{{- if not (regexMatch "^wss?://[^/:]+:[0-9]+$" .Values.stream.url) }}
+{{- fail (printf "stream.url must be ws://host:port or wss://host:port, got %q. The port is not optional: the chart reads it back out of this value to tell the viewer's page which port to reach LiveKit on. Use the in-cluster address, e.g. ws://livekit-clb.%s.svc.cluster.local:7880." .Values.stream.url .Release.Namespace) }}
 {{- end }}
 {{- end }}
+
 {{- end }}
+
 {{/*
 The chart ships no default image tag, so catch it here: an empty tag would otherwise render as
 "repo:" and surface much later as a confusing ImagePullBackOff.
@@ -159,7 +154,7 @@ failure -- the whole framework simply vanishes from the image -- so it is reject
 {{- end }}
 
 {{- include "isaaclab.streaming.validate" . }}
-{{- include "isaaclab.livekit.validate" . }}
+{{- include "isaaclab.stream.validate" . }}
 {{- include "isaaclab.viewer.validate" . }}
 {{- end }}
 
@@ -170,8 +165,11 @@ lists every running training and plays it.
 */}}
 {{- define "isaaclab.viewer.validate" -}}
 {{- if .Values.viewer.enabled }}
-{{- if not .Values.livekit.enabled }}
-{{- fail "viewer.enabled=true requires livekit.enabled=true: the viewer signs its tokens with the LiveKit server's Secret, so there is nothing to sign for without a server. To watch a server owned by another release, deploy the viewer from that release instead." }}
+{{- if eq .Values.mode "render" }}
+{{- fail "viewer.enabled=true does not apply when mode=render: the viewer watches TRAINING runs published to LiveKit. A render release streams its own interactive session over streaming.loadBalancer, and there is nothing for the page to list." }}
+{{- end }}
+{{- if or (not .Values.stream.url) (not .Values.stream.existingSecret) }}
+{{- fail (printf "viewer.enabled=true requires stream.url and stream.existingSecret — this is the ONLY thing in the chart that makes LiveKit mandatory. The page lists the rooms on that server and signs each visitor a token with that server's own Secret, so without both it has nothing to show and nothing to sign with:\n\n  stream:\n    url: ws://livekit-clb.%s.svc.cluster.local:7880   # IN-CLUSTER; the backend uses this\n    existingSecret: livekit-auth                        # the SAME Secret the server reads\n\nThis chart does not deploy LiveKit. See \"Finding these values in your cluster\" in the chart README." .Release.Namespace) }}
 {{- end }}
 {{/*
 No check on viewer.image.tag: empty means "follow image.tag", which is the common case since both
@@ -203,8 +201,39 @@ value is indistinguishable from a working one until someone tries the wrong pass
 {{- if not (has .Values.viewer.service.type (list "LoadBalancer" "ClusterIP")) }}
 {{- fail (printf "viewer.service.type must be \"LoadBalancer\" or \"ClusterIP\", got %q." .Values.viewer.service.type) }}
 {{- end }}
-{{- if and (eq .Values.viewer.service.type "LoadBalancer") (not (has .Values.viewer.service.addressType (list "PUBLIC" "PRIVATE"))) }}
+{{- if eq .Values.viewer.service.type "LoadBalancer" }}
+{{/*
+The same pair, and the same two mistakes, as streaming.loadBalancer.
+
+⚠️ Binding to a CLB the CCM itself created works in the DATA PATH -- listener and backend group
+are built, the page is reachable -- but the CCM will not record ownership of it, so the Service
+never gets .status.loadBalancer.ingress and reconcile fails every ~30s forever. That is a
+deliberate trade, documented in values.yaml, not a fault. Nothing here can check an id's
+provenance anyway; this only catches the shape.
+*/}}
+{{- if .Values.viewer.service.create }}
+{{- if .Values.viewer.service.existingId }}
+{{- fail "viewer.service.existingId must be empty when viewer.service.create=true. Set create=false to bind to a CLB created in the console or through the API, or leave existingId empty to provision one." }}
+{{- end }}
+{{- else }}
+{{- if not .Values.viewer.service.existingId }}
+{{- fail "viewer.service.existingId is required when viewer.service.create=false. Use the LiveKit server's CLB — port 80 does not collide with its 7880/7881/7882, so the page fits on it:\n\n  kubectl get svc <livekit-service> -n <livekit-namespace> --show-labels\n\nand read service.beta.kubernetes.io/volcengine-loadbalancer-id. Or set create=true to give the page a load balancer of its own." }}
+{{- end }}
+{{- end }}
+{{- if not (has .Values.viewer.service.addressType (list "PUBLIC" "PRIVATE")) }}
 {{- fail (printf "viewer.service.addressType must be \"PUBLIC\" or \"PRIVATE\", got %q." .Values.viewer.service.addressType) }}
+{{- end }}
+{{- end }}
+{{/*
+REQUIRED, always. The page has to be handed an address a BROWSER can reach, and only the operator
+knows it: LiveKit sits on its own load balancer, which this release neither creates nor can be
+pointed at (the CCM refuses to bind a Service to a CLB it created). Discovering it from the
+viewer's own Service was possible only while the two shared one instance, and that arrangement
+turned out not to be allowed -- so the lookup would now confidently return the WRONG address and
+the page would fail to connect with nothing to read.
+*/}}
+{{- if not .Values.viewer.publicLivekitUrl }}
+{{- fail "viewer.publicLivekitUrl is required when viewer.enabled=true: it is the address a BROWSER uses to reach LiveKit, and nothing in this release can derive it. The backend reaches LiveKit in-cluster through stream.url, but a browser cannot resolve a Service name -- it needs the LiveKit CLB's public address.\n\n  viewer:\n    publicLivekitUrl: ws://<livekit-clb-public-ip>:7880\n\nRead it from the LiveKit Service (see the chart README, \"Finding these values in your cluster\"):\n  kubectl get svc <livekit-service> -n <livekit-namespace> -o jsonpath='{.status.loadBalancer.ingress[0].ip}'\n\n⚠️ ws://, not https:// -- and the page must then be opened over http, since an https page may not open a plaintext ws:// connection." }}
 {{- end }}
 {{- if hasPrefix "https://" .Values.viewer.publicLivekitUrl }}
 {{- fail "viewer.publicLivekitUrl is a LiveKit signalling URL, not a web address: use ws:// or wss://." }}
@@ -239,39 +268,6 @@ the other, and the duplicate would slip through.
 {{- $ports := list (toString .Values.streaming.signallingPort) (toString .Values.streaming.nvcfPort) (toString .Values.streaming.mediaPort) }}
 {{- if ne (len (uniq $ports)) 3 }}
 {{- fail (printf "streaming.signallingPort, streaming.nvcfPort and streaming.mediaPort must all differ, got %s." (join ", " $ports)) }}
-{{- end }}
-{{- end }}
-{{- end }}
-
-{{/*
-Advisory hardware check. Returns warning text when nodeSelector pins an instance type that is
-not listed for this mode, and nothing otherwise. NEVER fails: the lists ship empty and are
-maintained by hand, so treating them as authoritative would block valid deployments.
-
-Rendering needs a GPU with a display engine and the NVENC encoder the WebRTC stream feeds off;
-training needs neither. A release that has to do both must sit on an instance type present in
-both lists.
-*/}}
-{{- define "isaaclab.hardware.warning" -}}
-{{- $key := .Values.hardware.instanceTypeKey }}
-{{- $selected := "" }}
-{{- with .Values.nodeSelector }}
-{{- $selected = default "" (index . $key) }}
-{{- end }}
-{{- if $selected }}
-{{- $render := eq (include "isaaclab.isRender" $) "true" }}
-{{- $list := ternary .Values.hardware.renderInstanceTypes .Values.hardware.trainInstanceTypes $render }}
-{{- if and $list (not (has $selected $list)) }}
-nodeSelector pins {{ $key }}={{ $selected }}, which is not in hardware.{{ if $render }}render{{ else }}train{{ end }}InstanceTypes:
-    {{ join ", " $list }}
-  {{- if $render }}
-  Rendering needs a GPU with a display engine and an NVENC encoder. If this instance type has
-  neither, Isaac Sim starts but the stream never produces a picture.
-  {{- else }}
-  This instance type is not on the validated training list.
-  {{- end }}
-  This is advisory only — nothing was blocked. Update hardware.{{ if $render }}render{{ else }}train{{ end }}InstanceTypes
-  if the list is out of date.
 {{- end }}
 {{- end }}
 {{- end }}

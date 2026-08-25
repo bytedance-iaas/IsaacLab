@@ -72,17 +72,33 @@ fi
 # keeps the chart's identity in one place and this script out of the business of
 # parsing YAML.
 mkdir -p "${work}/pkg"
-# The chart depends on the livekit chart from the same OCI registry. Without this the lint
-# below reports a missing dependency and `helm package` ships a chart that cannot render its
-# LiveKit path.
-helm dependency update "${chart_dir}"
-
-# Both modes are linted. They render different objects -- render mode alone brings up the
-# load balancer Service, the RBAC and an init container -- so linting just the default
-# would let a template error in the render-only path ship unnoticed.
 lint_args=(--set image.tag=ci-lint --set persistence.storageClass=ci-lint)
+
+# `helm lint` checks the chart's shape. It does NOT fail on a template error -- helm 4 logs
+# `funcMap fail` at INFO and still exits 0 -- so it cannot be the only gate here, or a chart that
+# renders nothing at all would ship a green build.
 helm lint "${chart_dir}" "${lint_args[@]}" --set mode=train
-helm lint "${chart_dir}" "${lint_args[@]}" --set mode=render
+
+# `helm template` DOES fail, so this is the real check. Every shape the chart supports renders a
+# different set of objects, and a template error in any one of them would otherwise ship
+# unnoticed: render mode alone brings up the stream load balancer, its RBAC and an init
+# container; the viewer brings up a second Deployment, a second Service and RBAC of its own;
+# train mode without streaming leaves all of it out.
+helm template lint-check "${chart_dir}" "${lint_args[@]}" >/dev/null
+helm template lint-check "${chart_dir}" "${lint_args[@]}" \
+  --set stream.url=ws://livekit-clb.default.svc.cluster.local:7880 \
+  --set stream.existingSecret=livekit-auth >/dev/null
+helm template lint-check "${chart_dir}" "${lint_args[@]}" \
+  --set stream.url=ws://livekit-clb.default.svc.cluster.local:7880 \
+  --set stream.existingSecret=livekit-auth \
+  --set viewer.enabled=true --set viewer.publicLivekitUrl=ws://10.0.0.1:7880 >/dev/null
+# Binding an existing CLB renders a different annotation set from provisioning one.
+helm template lint-check "${chart_dir}" "${lint_args[@]}" \
+  --set stream.url=ws://livekit-clb.default.svc.cluster.local:7880 \
+  --set stream.existingSecret=livekit-auth \
+  --set viewer.enabled=true --set viewer.publicLivekitUrl=ws://10.0.0.1:7880 \
+  --set viewer.service.create=false --set viewer.service.existingId=clb-lint >/dev/null
+helm template lint-check "${chart_dir}" "${lint_args[@]}" --set mode=render >/dev/null
 
 helm package "${chart_dir}" --destination "${work}/pkg"
 package="$(echo "${work}/pkg"/*.tgz)"

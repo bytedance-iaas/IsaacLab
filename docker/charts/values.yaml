@@ -16,8 +16,9 @@
 #           it render. Adds a load balancer for the stream, the RBAC the pod needs to discover
 #           its own public address, and starts Isaac Sim automatically.
 #
-# The two need different hardware. See `hardware` at the bottom of this file, and the chart
-# README for the instance types each one is validated on.
+# The two need different hardware — rendering needs a GPU with a display engine and an NVENC
+# encoder, training does not. The chart does NOT check this: see "Hardware" in the chart README
+# for which machines each mode needs, and put the right ones in the node pool.
 mode: train
 
 # Resource names come from the RELEASE name. ⚠️ The name also determines the PVC
@@ -27,7 +28,7 @@ nameOverride: ""
 
 image:
   # The registry holding your build.
-  repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab
+  repository: ai-containers-cn-beijing.cr.volces.com/physicalai/isaaclab
   # REQUIRED, and deliberately empty: the chart does not track the image. Builds are tagged per
   # commit and there is no `latest`, so hardcoding one here would mean republishing the chart for
   # every build — the chart version and the image version are not the same thing.
@@ -46,8 +47,8 @@ imagePullSecrets: []
 #
 # ⚠️ The two modes do NOT accept the same hardware: training wants compute, rendering needs a GPU
 # with a display engine and the NVENC encoder the WebRTC stream feeds off. A machine that trains
-# happily may not render at all. If you intend to do both on one node, the instance type has to
-# be in BOTH lists under `hardware` below — see the chart README for the matrix.
+# happily may not render at all, and the failure is a stream that connects and stays black rather
+# than an error. NOTHING HERE VERIFIES IT — the node pool has to be right. See the chart README.
 #
 # ⚠️ Worth doing once a PVC exists: zonal volumes (ebs-*) cannot follow a pod rescheduled into
 # another zone, so it can never attach the disk it already has.
@@ -199,10 +200,7 @@ streaming:
     #
     # ⚠️ Only applies when the chart CREATES the CLB. Binding to an existing one (create=false)
     #    inherits whatever that CLB was given — check it in the console.
-    # Both documented spellings of the annotation are sent, because the CCM echoes annotations
-    # back verbatim whether or not it understands them -- a wrong key is indistinguishable from a
-    # working one through the API, so there was no way to tell which one it reads. Confirmed
-    # working end to end: a release requesting 10 showed 10 Mbps on the EIP in the console.
+    # Confirmed working end to end: a release requesting 10 came out as 10 Mbps on the EIP.
     bandwidthMbps: 10
 
     # EIP billing. Empty leaves it to the platform, which is the right default: the two modes
@@ -231,100 +229,63 @@ streaming:
 # own WebRTC is a remote desktop protocol that carries input back.
 #
 # ⚠️ `--stream` renders a camera view, so a run using it needs a GPU that can RENDER, not merely
-#    compute — the "both jobs on one node" case in `hardware` below.
+#    compute. A node that can do both is the one to pin for a release whose runs use it.
 
-# The publisher side: which server this release's training runs publish to. Independent of
-# whether this release also deploys one.
+# The publisher side: WHICH LIVEKIT SERVER this release's training runs publish to.
+#
+# THIS CHART DOES NOT DEPLOY LIVEKIT. That server is separate infrastructure with its own chart
+# and its own lifetime — one server serves every training release in the cluster, which is the
+# whole reason this path beats exposing each run directly. Bundling it here as a subchart would
+# have argued the opposite: a server, and a load balancer, per training release.
+#
+# So this chart is only ever TOLD where the server is. Install it once:
+#
+#   kubectl create secret generic livekit-auth -n <namespace> \
+#     --from-literal=keys="devkey: $(openssl rand -hex 32)"
+#
+#   helm install livekit oci://ai-containers-cn-beijing.cr.volces.com/physicalai/livekit \
+#     -n <namespace> --set nameOverride=livekit \
+#     --set auth.existingSecret=livekit-auth \
+#     --set service.subnetId=<subnet-in-this-cluster-vpc>
+#
+# and then fill in the two values below. See "Finding these values in your cluster" in the chart
+# README for the exact kubectl commands.
+#
+# ⚠️ OPTIONAL, and only the VIEWER makes it mandatory. Most training runs never call --stream, so
+#    a release that leaves these empty is an ordinary headless deployment and installs without
+#    complaint: nothing is wired into the pod, and --stream would fall back to whatever address
+#    livekit_stream.py was built against. Turn viewer.enabled on and both values become required —
+#    the page lists the rooms on that server and signs each visitor a token with its Secret.
+#
+# ⚠️ Set BOTH or NEITHER. One alone is a half-configured publisher, and each half looks configured
+#    while nothing works: an address with no credentials authenticates against nothing, and
+#    credentials with no address are used against a server nobody chose.
 stream:
-  # Where to publish, e.g. ws://livekit-clb.default.svc.cluster.local:7880
+  # The LiveKit server's signalling address, as `ws://host:port`.
   #
-  # Empty is usually right. It is derived from the LiveKit dependency when livekit.enabled=true,
-  # and otherwise the publisher falls back to the default compiled into livekit_stream.py. Set it
-  # to reach a server deployed by another release.
+  # Use the IN-CLUSTER address, e.g. ws://livekit-clb.<namespace>.svc.cluster.local:7880 — not the
+  # public VIP. The publisher runs inside the cluster, so going out to the public address and back
+  # is a hairpin that pays for a round trip and egress to reach a pod beside it. (The BROWSER does
+  # need the public one; that is viewer.publicLivekitUrl, and the two must differ.)
   #
-  # Prefer the in-cluster address over the public VIP: the publisher runs inside the cluster, so
-  # going out to the public IP and back is a hairpin that pays for a round trip and egress for
-  # nothing.
+  # ⚠️ The port is not optional. The chart reads it back out of this value to tell the viewer's
+  #    page which port to reach LiveKit on, so there is no second value that could disagree.
   url: ""
 
-  # Room name. Empty is the right default: the chart then supplies JOB_NAME (the pod name) instead
-  # and livekit_stream.py derives train-$JOB_NAME, which keeps the decision as close to the run as
-  # a deployment can put it. Set this only to pin every run on this release into one named room.
+  # The Secret holding LiveKit's `keys` map (`api_key: api_secret`), IN THIS NAMESPACE.
   #
-  # ⚠️ Leaving it empty does NOT give you one room per run. replicas is 1, so the pod name is
-  #    effectively the release name, and two runs started by hand in the SAME pod still publish
-  #    into the same room and overwrite each other. Fixing that needs the room name to carry
-  #    something only the run knows -- the task, a timestamp -- which lives in livekit_stream.py.
-  room: ""
-
-  # Secret holding the LiveKit credentials, in LiveKit's own `keys` format (`api_key: api_secret`).
-  # Empty derives the one the dependency creates when livekit.enabled=true — so both ends read the
-  # SAME Secret and cannot end up with different credentials.
-  #
-  # Set it only to reach a server deployed elsewhere; it is then that release's <name>-auth.
+  # ⚠️ It must be the SAME object the server reads, not a copy — two copies of one credential are
+  #    free to drift, and the failure mode is a connection that authenticates and then fails.
+  #    Secrets do not cross namespaces, so if LiveKit runs in another one, copy it in:
+  #      kubectl get secret livekit-auth -n <livekit-ns> -o yaml \
+  #        | sed '/namespace:/d;/resourceVersion:/d;/uid:/d;/creationTimestamp:/d' \
+  #        | kubectl apply -n <this-ns> -f -
   existingSecret: ""
 
-# ---------------------------------------------------------------------------------------------
-# The LiveKit server itself. Everything under this key belongs to the `livekit` DEPENDENCY
-# declared in Chart.yaml — see that chart's own values.yaml for the full set; only the keys that
-# matter here are repeated.
-#
-# ⚠️ LiveKit is SHARED infrastructure. Turn this on for exactly ONE release — a bootstrap install,
-#    or the first training release in a new environment — and leave it false everywhere else,
-#    pointing those at the existing server through stream.url. Deploying one per training run
-#    gives you N servers and N load balancers, which is worse than not using LiveKit at all.
-#
-# ⚠️ Uninstalling the release that owns the server takes the server away from every run still
-#    publishing to it. Its CLB survives by default (service.keepOnUninstall), so the address at
-#    least stays claimed.
-# ---------------------------------------------------------------------------------------------
-livekit:
-  enabled: false
+  # Room name. Empty is right: the chart supplies JOB_NAME instead and livekit_stream.py derives
+  # train-$JOB_NAME, which keeps the decision as close to the run as a deployment can put it.
+  room: ""
 
-  # Fixed rather than release-derived, for two reasons: the dependency names its objects
-  # <name>-ip, which would otherwise collide with this chart's own ServiceAccount, and a shared
-  # server should have a stable address that does not change with whichever release happens to
-  # own it. Gives livekit-clb, livekit-auth, and so on.
-  nameOverride: livekit
-
-  auth:
-    # REQUIRED when enabled. LiveKit's `keys` map, one `api_key: api_secret` pair per line:
-    #
-    #   auth:
-    #     keys: |
-    #       devkey: <openssl rand -hex 32>
-    #
-    # ⚠️ This value goes into the Helm release history verbatim, where anyone who can run
-    #    `helm get values` will read it. The dependency takes it this way deliberately — the
-    #    install path is the VKE console's Helm page, which has no shell, so "create the Secret
-    #    first" is not something anyone can do there. Use a dedicated key, not a shared one.
-    keys: ""
-
-  service:
-    # REQUIRED when enabled, and specific to your cluster: the CLB is created from this subnet,
-    # which must be in the cluster's VPC. A subnet from elsewhere is the usual reason the CLB
-    # never gets a public IP and media never connects.
-    subnetId: ""
-    addressType: internet
-    # Keeps the CLB when the release is uninstalled. Leave true for anything real: that public IP
-    # is baked into every client's URL, and deleting it does not give the address back.
-    keepOnUninstall: true
-    ports:
-      signal: 7880
-      rtcTcp: 7881
-      rtcUdp: 7882
-
-# ---------------------------------------------------------------------------------------------
-# Hardware matrix. Advisory only — the chart NEVER fails on these, it prints a warning in the
-# install notes when nodeSelector pins an instance type that is not listed for the mode.
-#
-# ⚠️ PLACEHOLDER VALUES. Both lists are empty, which disables the warning entirely. Fill them in
-# with the instance types validated in your environment; see the chart README for the reasoning
-# (rendering needs a display engine and NVENC, training does not).
-#
-# If a release is meant to both train and render on one node, the instance type must appear in
-# BOTH lists — the intersection is the only hardware that can do both.
-# ---------------------------------------------------------------------------------------------
 # ---------------------------------------------------------------------------------------------
 # STREAM VIEWER — the page people open to watch a training run
 # ---------------------------------------------------------------------------------------------
@@ -333,22 +294,37 @@ livekit:
 # to and plays one in the browser. Viewers never handle a LiveKit key: the backend holds the
 # credential and signs a short-lived, read-only, single-room token for each page.
 #
-# Tied to livekit.enabled, because it signs those tokens with the LiveKit server's own Secret —
-# without a server there is nothing to sign for and nothing to watch.
+# THIS is what makes LiveKit mandatory: it signs those tokens with the LiveKit server's
+# own credential and reads the room list from that server, so there is nothing to watch without
+# one.
 #
 # ⚠️ Its image is built SEPARATELY from the training image — that one is ~8.5 GB and this is a
 #    slim Python base, so a wording change on the page must not rebuild it. They are still
 #    released together, which is why viewer.image.tag defaults to following image.tag; it exists
 #    for the times the two have to be pinned apart.
 viewer:
-  # Requires livekit.enabled=true.
+  # Requires stream.url and stream.existingSecret — the only reason this chart needs LiveKit.
   enabled: false
 
   image:
-    repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab-viewer
+    repository: ai-containers-cn-beijing.cr.volces.com/physicalai/isaaclab-viewer
     # Empty means "follow image.tag" — both images come out of the same build and normally move
     # together. Set it only to deliberately pin them apart.
     tag: ""
+    pullPolicy: IfNotPresent
+
+  # The image the address-discovery init container runs in. Any image with `sh` and `wget` will
+  # do; it makes one call to the Kubernetes API and exits.
+  #
+  # It is NOT the viewer image: that base is python:3.11-slim, which has neither. The LiveKit
+  # server image is the default because it has both, it is already being pulled into this cluster
+  # for the server itself, and pulling a third image (kubectl, curl) is a slow and failure-prone
+  # extra dependency from CN.
+  #
+  # Unused when viewer.publicLivekitUrl is set — that removes the init container entirely.
+  initImage:
+    repository: docker.m.daocloud.io/livekit/livekit-server
+    tag: v1.13.5
     pullPolicy: IfNotPresent
 
   # Container port. Must match what the viewer image serves on (its Dockerfile sets PORT=8080).
@@ -384,25 +360,79 @@ viewer:
   service:
     # LoadBalancer publishes the page; ClusterIP keeps it to port-forward only.
     type: LoadBalancer
-    # PUBLIC is the default here, unlike the render stream — this page has a password in front of
-    # it and is meant to be opened from a browser. PRIVATE if you would rather reach it through a
-    # bastion or put your own gateway in front.
+
+    # Provision a CLB for the page, or bind to one that already exists.
+    #
+    # true is the default: it needs no preparation, the Service reports its address normally, and
+    # the CLB goes away with the release — the right trade for a page whose address nobody has
+    # memorised.
+    create: true
+
+    # create=false: REQUIRED. Bind to an existing CLB — to keep an address people already have, or
+    # to put the page on a load balancer that carries something else (its one TCP port does not
+    # collide with LiveKit's 7880/7881/7882).
+    #
+    #   kubectl get svc <service> -n <namespace> --show-labels
+    #
+    # and read service.beta.kubernetes.io/volcengine-loadbalancer-id.
+    #
+    # ⚠️ A CLB THE CCM ITSELF CREATED LEAVES THIS SERVICE AT <pending> FOREVER. The data path is
+    #    built correctly — the listener and its backend group are created and the page is
+    #    reachable — but the CCM will not record ownership of a load balancer it made:
+    #
+    #      can not reuse clb <id> which is created by vke
+    #
+    #    so .status.loadBalancer.ingress is never written, and reconcile fails again every ~30s
+    #    for the life of the release. `kubectl get svc` looks broken: it is unadopted, not broken.
+    #    The backend group is also probably not refreshed after a node change (UNVERIFIED).
+    #
+    #    A CLB created OUTSIDE Kubernetes — console, API, Terraform — has neither problem.
+    #
+    # ⚠️ Two Services must not bind one CLB on the same ports; the second one's listeners collide
+    #    with the first, and that collision is invisible from Kubernetes.
+    existingId: ""
+
+    # PUBLIC, unlike the render stream — this page has a password in front of it and is meant to
+    # be opened from a browser.
+    #
+    # ⚠️ This must MATCH the CLB above. It is what the CCM checks the Service against, not a
+    #    request to change the instance — every Service on one CLB is public or private together.
+    #    The LiveKit chart spells its equivalent `internet`; both end up public.
     addressType: PUBLIC
+
     port: 80
+
+    # create=true only. Which subnet the CLB is placed in; empty lets the platform choose.
+    # ⚠️ Must be in THIS cluster's VPC, or the CLB never gets an address.
     subnetId: ""
+
+    # create=true only. Public bandwidth cap, Mbps; the platform default is 1.
+    #
+    # This CLB carries the PAGE ONLY — a few static files and two small JSON endpoints. Video never
+    # touches it: the browser opens its WebSocket and its media straight to LiveKit. So 10 is
+    # already generous here, and raising it does nothing for picture quality — that is LiveKit's
+    # CLB, sized where LiveKit was installed.
     bandwidthMbps: 10
+
     annotations: {}
     waitAttempts: 120
 
-  # The address the PAGE uses to reach LiveKit, as opposed to the in-cluster one the backend uses.
-  # Empty derives the LiveKit load balancer's public VIP at runtime, which is almost always right.
+  # REQUIRED. The address a BROWSER uses to reach LiveKit — as opposed to stream.url, which is how
+  # the BACKEND reaches it from inside the cluster. The two must differ: a browser cannot resolve a
+  # Service name, and sending the backend out to the public address pays for a round trip and
+  # egress to reach a pod beside it.
   #
-  # ⚠️ The two must be different. A browser cannot resolve an in-cluster Service name, and sending
-  #    the backend out to the public VIP pays for a round trip and egress to reach a pod beside it.
+  #   publicLivekitUrl: ws://<livekit-clb-public-ip>:7880
   #
-  # ⚠️ Set this to a wss:// URL once LiveKit terminates TLS. Until then the page must be opened
-  #    over http: a https page is not allowed to open a plaintext ws:// connection, so an https
-  #    page against a ws:// LiveKit connects to nothing.
+  # Nothing here can derive it. LiveKit sits on its own load balancer, which this release neither
+  # creates nor can bind to — the CCM refuses to attach a Service to a CLB it created itself. (An
+  # earlier version discovered it from the viewer's own Service, which was correct only while the
+  # two shared one CLB; that arrangement turns out not to be allowed, so the lookup would now
+  # return the wrong address with full confidence.)
+  #
+  # ⚠️ ws://, not https://. And the page must then be opened over http: an https page is not
+  #    allowed to open a plaintext ws:// connection, so it would load and never connect. Set this
+  #    to the wss:// URL once LiveKit terminates TLS.
   publicLivekitUrl: ""
 
   # How long a viewer's token stays valid, seconds.
@@ -411,11 +441,3 @@ viewer:
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 256Mi }
-
-hardware:
-  # The nodeSelector key that carries the instance type. Only used to find the value to check.
-  instanceTypeKey: node.kubernetes.io/instance-type
-  # Instance types validated for mode=render (display engine + NVENC encoder).
-  renderInstanceTypes: []
-  # Instance types validated for mode=train.
-  trainInstanceTypes: []

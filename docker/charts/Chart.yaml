@@ -8,13 +8,9 @@ name: isaaclab
 description: Isaac Lab on Kubernetes — training workloads, or an Isaac Sim workstation streamed over WebRTC
 type: application
 
-# Chart version. Bump on every packaging change. Independent of the appVersion below: the chart
-# can change without the application changing, and vice versa.
-#
-# 0.1.0 is the first release. It covers both workloads through a single `mode` value — `train`
-# for headless Isaac Lab runs, `render` for a WebRTC-streamed Isaac Sim workstation — and pulls
-# in the livekit chart for live training views (livekit.enabled).
-version: 0.1.0
+# Chart version. Bump on every packaging change. Independent of appVersion below: the chart can
+# change without the application changing, and vice versa.
+version: 0.2.0
 
 # Isaac Lab release this chart targets. Not the image tag — the chart pins no image (image.tag is
 # required at install time), so this tracks the repository version instead.
@@ -32,20 +28,3 @@ keywords:
 home: https://isaac-sim.github.io/IsaacLab/
 sources:
   - https://github.com/bytedance-iaas/IsaacLab
-
-# The LiveKit SFU that `train.py --stream` publishes to. Pulled in rather than reimplemented:
-# it already solves the same problems this chart would have had to (advertising the load
-# balancer's VIP to clients, provisioning the CLB) and additionally keeps the CLB on uninstall,
-# which matters because that public IP is baked into every client's URL.
-#
-# Gated on a condition, because LiveKit is SHARED infrastructure -- one server serves many
-# training runs, and deploying one per run would defeat the point. Enable it on one release and
-# point the others at it with stream.url.
-#
-# ⚠️ Requires `helm dependency update docker/charts` before packaging or installing from source;
-#    docker/publish_charts.sh does this.
-dependencies:
-  - name: livekit
-    version: "0.3.2"
-    repository: "oci://ai-containers-cn-beijing.cr.volces.com/physicalai"
-    condition: livekit.enabled

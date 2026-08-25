@@ -40,10 +40,7 @@ metadata:
     {{- with $lb.bandwidthMbps }}
     # Public bandwidth cap. The platform default is 1 Mbps, which cannot carry video -- the stream
     # connects and then stalls, which reads as a broken stream rather than a capped link.
-    # Both documented spellings are sent: the CCM echoes annotations back whether or not it
-    # understands them, so neither could be confirmed from the outside. Setting both is harmless.
     service.beta.kubernetes.io/volcengine-loadbalancer-bandwidth: {{ . | quote }}
-    service.beta.kubernetes.io/volcengine-loadbalancer-eip-bandwidth: {{ . | quote }}
     {{- end }}
     {{- with $lb.eipBillingType }}
     service.beta.kubernetes.io/volcengine-loadbalancer-eip-billing-type: {{ . | quote }}
