@@ -362,7 +362,7 @@ viewer:
   #
   # Create the Secret first, in the release namespace:
   #
-  #   kubectl create secret generic physical-ai-auth -n <namespace> \
+  #   kubectl create secret generic isaaclab-viewer-auth -n <namespace> \
   #     --from-literal=username=<user> --from-literal=password='<password>'
   #
   # The chart cannot create it from values: Helm stores values verbatim in the release history,
@@ -376,7 +376,7 @@ viewer:
   # ⚠️ The variable names below are the contract with viewer/server.py. If that file reads
   #    different names, these must change with it or the page comes up unauthenticated.
   auth:
-    existingSecret: physical-ai-auth
+    existingSecret: isaaclab-viewer-auth
     usernameKey: username
     passwordKey: password
 
