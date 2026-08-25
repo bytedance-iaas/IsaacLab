@@ -182,6 +182,19 @@ lists every running training and plays it.
 {{- if or (not .Values.viewer.auth.usernameKey) (not .Values.viewer.auth.passwordKey) }}
 {{- fail "viewer.auth.usernameKey and viewer.auth.passwordKey are both required." }}
 {{- end }}
+
+{{/*
+Refuse a credential passed through values instead of ignoring it. The template reads only
+existingSecret, so a --set viewer.auth.password=... would otherwise take effect nowhere while
+looking like it had -- and the operator would believe a password was in place that never was.
+Failing here is also the only moment anyone is looking: by the time the page is up, an ignored
+value is indistinguishable from a working one until someone tries the wrong password and gets in.
+*/}}
+{{- range $key := (list "username" "password" "passwd" "secret" "credentials" "htpasswd") }}
+{{- if hasKey $.Values.viewer.auth $key }}
+{{- fail (printf "viewer.auth.%s is not a supported value: credentials are only ever read from an existing Secret, never passed through values. Helm stores values verbatim in the release history, so anyone able to run `helm get values` would read the password back. Create the Secret first and name it in viewer.auth.existingSecret:\n  kubectl create secret generic physical-ai-auth -n <namespace> --from-literal=username=<user> --from-literal=password='<password>'" $key) }}
+{{- end }}
+{{- end }}
 {{- if eq .Values.viewer.auth.usernameKey .Values.viewer.auth.passwordKey }}
 {{- fail "viewer.auth.usernameKey and viewer.auth.passwordKey must be different." }}
 {{- end }}
