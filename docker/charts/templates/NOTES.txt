@@ -37,7 +37,7 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
 {{- if .Values.streaming.publicEndpoint }}
 
 2. Isaac Sim starts on its own and advertises {{ .Values.streaming.publicEndpoint }}, which you
-   set explicitly. Point a WebRTC streaming client at:
+   set explicitly. Point the Isaac Sim WebRTC Streaming Client at:
 
      {{ .Values.streaming.publicEndpoint }}:{{ .Values.streaming.signallingPort }}
 
@@ -54,13 +54,13 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
 
      kubectl logs {{ $fullname }}-0 -n {{ .Release.Namespace }} -c wait-clb-ip
 
-   Point a WebRTC streaming client at that address on port {{ .Values.streaming.signallingPort }}.
+   Point the Isaac Sim WebRTC Streaming Client at that address, port {{ .Values.streaming.signallingPort }}.
 {{- if .Values.streaming.loadBalancer.create }}
 
-   ⚠️ Check the bandwidth on that CLB's public IP in the console. The chart asked for
-   {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps, but the platform echoes the request
-   back whether or not it honoured it, so kubectl cannot tell you. The default it falls back to
-   is 1 Mbps, which cannot carry video — the stream connects and then stalls.
+   ⚠️ Check that CLB's public bandwidth in the console — the platform echoes the request back
+   whether or not it honoured it, so kubectl cannot tell you. The default it falls back to is
+   1 Mbps, which cannot carry video: the stream connects and then stalls. This release asked
+   for {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps.
 {{- end }}
 {{- end }}
 
@@ -68,16 +68,17 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
 
      kubectl logs -f {{ $fullname }}-0 -n {{ .Release.Namespace }}
 
-   The UDP media port ({{ .Values.streaming.mediaPort }}) is bound lazily, at session setup. It
-   stays absent until the first client connects — that is expected. To check it once connected,
-   without any tools in the image:
+   The UDP media port is bound lazily, at session setup, so it stays absent until the first
+   client connects — that is expected, not a fault. To check it once a client is connected,
+   without needing any tools in the image:
 
      kubectl exec {{ $fullname }}-0 -n {{ .Release.Namespace }} -- \
        sh -c 'grep -i ":$(printf %04X {{ .Values.streaming.mediaPort }}) " /proc/net/udp'
 
-   ⚠️ If signalling connects but the picture never arrives, try the native streaming client or
-   Firefox before suspecting the network: Chrome and Safari have a known issue with Isaac Sim
-   running in a container.
+   ⚠️ Connect with the Isaac Sim WebRTC Streaming Client — a browser cannot open this directly.
+   The signalling port speaks WebSocket rather than HTTP, and this Isaac Sim serves no client
+   page of its own: NVIDIA retired the extension that used to host one. Browser access would
+   need a front end built on the Omniverse WebRTC Streaming Library.
 {{- else }}
 
 2. Exec in and launch training:
