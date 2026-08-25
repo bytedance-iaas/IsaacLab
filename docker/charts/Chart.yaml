@@ -47,5 +47,5 @@ sources:
 dependencies:
   - name: livekit
     version: "0.3.2"
-    repository: "oci://iaas-us-cn-beijing.cr.volces.com/physicalai"
+    repository: "oci://ai-containers-cn-beijing.cr.volces.com/physicalai"
     condition: livekit.enabled
