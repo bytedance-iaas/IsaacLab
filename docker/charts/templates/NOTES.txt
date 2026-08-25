@@ -5,7 +5,7 @@ Isaac Lab is deployed as {{ $fullname }} in namespace {{ .Release.Namespace }}, 
 Pod:     {{ $fullname }}-0
 Storage: data-{{ $fullname }}-0 ({{ .Values.persistence.size }}, {{ .Values.persistence.storageClass }}) at {{ .Values.persistence.mountPath }}
 {{- if $render }}
-Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
+Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB, {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}, bandwidth as configured on it{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
 {{- end }}
 
 {{- if and $render (eq .Values.streaming.loadBalancer.addressType "PUBLIC") }}
@@ -37,7 +37,7 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
 {{- if .Values.streaming.publicEndpoint }}
 
 2. Isaac Sim starts on its own and advertises {{ .Values.streaming.publicEndpoint }}, which you
-   set explicitly. Point a WebRTC streaming client at:
+   set explicitly. Point the Isaac Sim WebRTC Streaming Client at:
 
      {{ .Values.streaming.publicEndpoint }}:{{ .Values.streaming.signallingPort }}
 
@@ -54,30 +54,12 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
 
      kubectl logs {{ $fullname }}-0 -n {{ .Release.Namespace }} -c wait-clb-ip
 
-   Point a WebRTC streaming client at that address on port {{ .Values.streaming.signallingPort }}.
-{{- if .Values.streaming.loadBalancer.create }}
-
-   ⚠️ Check the bandwidth on that CLB's public IP in the console. The chart asked for
-   {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps, but the platform echoes the request
-   back whether or not it honoured it, so kubectl cannot tell you. The default it falls back to
-   is 1 Mbps, which cannot carry video — the stream connects and then stalls.
-{{- end }}
+   Point the Isaac Sim WebRTC Streaming Client at that address, port {{ .Values.streaming.signallingPort }}.
 {{- end }}
 
 3. Watch Isaac Sim start. It runs in the foreground, so its log is the container log:
 
      kubectl logs -f {{ $fullname }}-0 -n {{ .Release.Namespace }}
-
-   The UDP media port ({{ .Values.streaming.mediaPort }}) is bound lazily, at session setup. It
-   stays absent until the first client connects — that is expected. To check it once connected,
-   without any tools in the image:
-
-     kubectl exec {{ $fullname }}-0 -n {{ .Release.Namespace }} -- \
-       sh -c 'grep -i ":$(printf %04X {{ .Values.streaming.mediaPort }}) " /proc/net/udp'
-
-   ⚠️ If signalling connects but the picture never arrives, try the native streaming client or
-   Firefox before suspecting the network: Chrome and Safari have a known issue with Isaac Sim
-   running in a container.
 {{- else }}
 
 2. Exec in and launch training:
@@ -107,15 +89,10 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
      ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
        --task <task> --num_envs 16 --headless --stream
 
-   It publishes to room {{ include "isaaclab.stream.room" . }}. Demo use — keep num_envs small.
-
-   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
-      A run using it belongs on an instance type valid for BOTH modes.
+   It publishes to room {{ include "isaaclab.stream.room" . }}.
 {{- else if $lkurl }}
 
 3. Training can publish a live view to {{ $lkurl }} (room {{ include "isaaclab.stream.room" . }})
    by adding --stream to a run. That server is NOT managed by this release.
-
-   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
 {{- end }}
 {{- end }}

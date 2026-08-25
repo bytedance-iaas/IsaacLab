@@ -196,12 +196,13 @@ streaming:
     eipBillingType: ""     # empty = platform default; by-bandwidth and by-traffic differ a lot in cost
 ```
 
-> ⚠️ **Verify it in the console after deploying.** The CCM echoes these annotations back verbatim
-> whether or not it understands them — measured on this cluster: a probe Service carrying two
-> different spellings had *both* returned in
-> `system-volcengine-loadbalancer-last-applied-annotations`, with no warning either way. A wrong
-> key therefore looks identical to a working one from `kubectl`. The chart sends both documented
-> spellings for that reason, but the authoritative reading is the EIP's bandwidth in the console.
+**Confirmed working**: a release requesting 10 came out as 10 Mbps on the EIP in the console.
+
+The chart sends **both** documented spellings of the annotation, because there is no way to tell
+from the API which one the CCM reads — a probe Service carrying two different spellings had *both*
+returned in `system-volcengine-loadbalancer-last-applied-annotations`, with no warning either way.
+The CCM echoes annotations whether or not it understands them, so a wrong key is indistinguishable
+from a working one. Sending both costs nothing and removes the guess.
 
 Only applies when the chart **creates** the CLB. Binding to an existing one inherits whatever
 bandwidth that CLB already has.

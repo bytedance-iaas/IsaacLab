@@ -173,14 +173,29 @@ lists every running training and plays it.
 {{- if not .Values.livekit.enabled }}
 {{- fail "viewer.enabled=true requires livekit.enabled=true: the viewer signs its tokens with the LiveKit server's Secret, so there is nothing to sign for without a server. To watch a server owned by another release, deploy the viewer from that release instead." }}
 {{- end }}
-{{- if not .Values.viewer.image.tag }}
-{{- fail "viewer.image.tag is required when viewer.enabled=true. The viewer image is built and released separately from the training image, so it has its own tag." }}
-{{- end }}
+{{/*
+No check on viewer.image.tag: empty means "follow image.tag", which is the common case since both
+images come out of the same build. image.tag itself is already required, so an empty pair cannot
+get through -- and the viewer keeps its own key for the times the two need to be pinned apart.
+*/}}
 {{- if not .Values.viewer.auth.existingSecret }}
-{{- fail "viewer.auth.existingSecret is required. The viewer is published with HTTP Basic authentication in front of it and there is no way to turn that off -- a page that enumerates every running training and plays it must not be open. Create the Secret first, in the release namespace:\n  kubectl create secret generic physical-ai-auth -n <namespace> --from-literal=username=<user> --from-literal=password='<password>'\nThe chart deliberately cannot create it from values, because Helm keeps values in the release history where the password would stay readable." }}
+{{- fail "viewer.auth.existingSecret is required. The viewer is published with HTTP Basic authentication in front of it and there is no way to turn that off -- a page that enumerates every running training and plays it must not be open. Create the Secret first, in the release namespace:\n  kubectl create secret generic isaaclab-viewer-auth -n <namespace> --from-literal=username=<user> --from-literal=password='<password>'\nThe chart deliberately cannot create it from values, because Helm keeps values in the release history where the password would stay readable." }}
 {{- end }}
 {{- if or (not .Values.viewer.auth.usernameKey) (not .Values.viewer.auth.passwordKey) }}
 {{- fail "viewer.auth.usernameKey and viewer.auth.passwordKey are both required." }}
+{{- end }}
+
+{{/*
+Refuse a credential passed through values instead of ignoring it. The template reads only
+existingSecret, so a --set viewer.auth.password=... would otherwise take effect nowhere while
+looking like it had -- and the operator would believe a password was in place that never was.
+Failing here is also the only moment anyone is looking: by the time the page is up, an ignored
+value is indistinguishable from a working one until someone tries the wrong password and gets in.
+*/}}
+{{- range $key := (list "username" "password" "passwd" "secret" "credentials" "htpasswd") }}
+{{- if hasKey $.Values.viewer.auth $key }}
+{{- fail (printf "viewer.auth.%s is not a supported value: credentials are only ever read from an existing Secret, never passed through values. Helm stores values verbatim in the release history, so anyone able to run `helm get values` would read the password back. Create the Secret first and name it in viewer.auth.existingSecret:\n  kubectl create secret generic isaaclab-viewer-auth -n <namespace> --from-literal=username=<user> --from-literal=password='<password>'" $key) }}
+{{- end }}
 {{- end }}
 {{- if eq .Values.viewer.auth.usernameKey .Values.viewer.auth.passwordKey }}
 {{- fail "viewer.auth.usernameKey and viewer.auth.passwordKey must be different." }}
