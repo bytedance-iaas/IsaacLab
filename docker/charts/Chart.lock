@@ -1,6 +1,0 @@
-dependencies:
-- name: livekit
-  repository: oci://ai-containers-cn-beijing.cr.volces.com/physicalai
-  version: 0.3.2
-digest: sha256:bdacc537dd2fe19e387c3c524cce65ce8169cfd8c4205350983b5e510d447239
-generated: "2026-08-24T19:05:56.362028-07:00"

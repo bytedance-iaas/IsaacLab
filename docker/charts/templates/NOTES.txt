@@ -23,12 +23,6 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
   streaming.loadBalancer.addressType=PRIVATE and reach it over a bastion or VPN.
 {{- end }}
 
-{{- with (include "isaaclab.hardware.warning" . | trim) }}
-
-⚠️ HARDWARE WARNING
-  {{ . }}
-{{- end }}
-
 1. Wait for the pod:
 
      kubectl rollout status statefulset/{{ $fullname }} -n {{ .Release.Namespace }}
@@ -69,30 +63,67 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
    Nothing is exposed in train mode, by design. Write checkpoints and logs under
    {{ .Values.persistence.mountPath }} so they survive the pod.
 {{- $lkurl := include "isaaclab.stream.url" . }}
-{{- if .Values.livekit.enabled }}
+{{- if $lkurl }}
 
-3. A LiveKit server was deployed with this release. Get the address viewers connect to:
-
-     kubectl get svc {{ include "isaaclab.livekit.serviceName" . }} -n {{ .Release.Namespace }} \
-       -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
-
-   ⚠️ THIS SERVER IS SHARED. Point other training releases at it with:
-
-     --set stream.url={{ $lkurl }}
-
-   and leave livekit.enabled=false on those. Uninstalling THIS release stops the server for every
-   run still publishing to it. The CLB and its public address survive
-   {{- if .Values.livekit.service.keepOnUninstall }} (service.keepOnUninstall is on){{ else }} only if service.keepOnUninstall is turned on — it is currently OFF, so the address would be lost{{ end }}.
-
-4. Publish a training view to it by adding --stream to a run:
+3. Training publishes a live view to {{ $lkurl }} (room {{ include "isaaclab.stream.room" . }})
+   when a run is given --stream:
 
      ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
        --task <task> --num_envs 16 --headless --stream
 
-   It publishes to room {{ include "isaaclab.stream.room" . }}.
-{{- else if $lkurl }}
+   ⚠️ THAT SERVER IS NOT MANAGED BY THIS RELEASE. This chart deploys Isaac Lab and nothing else —
+   LiveKit is separate infrastructure, one server for the whole cluster. Check it is actually
+   there and that the Secret this release reads is the one IT reads:
 
-3. Training can publish a live view to {{ $lkurl }} (room {{ include "isaaclab.stream.room" . }})
-   by adding --stream to a run. That server is NOT managed by this release.
+     kubectl get svc -n {{ .Release.Namespace }} -l app=livekit
+     kubectl get secret {{ include "isaaclab.stream.secretName" . }} -n {{ .Release.Namespace }}
+
+   Two copies of one credential are free to drift, and the failure mode is a connection that
+   authenticates and then fails.
+{{- else }}
+
+3. No LiveKit server is named, so nothing is wired into the pod. That is the ordinary case —
+   most runs do not stream. `train.py --stream` would fall back to whatever address is compiled
+   into livekit_stream.py, which is unlikely to be one you want.
+
+   To publish a live view, set stream.url + stream.existingSecret. To watch it in a browser, add
+   viewer.enabled=true, which requires both of those.
+{{- end }}
+
+{{- if .Values.viewer.enabled }}
+
+4. The browser viewer is at{{ if eq .Values.viewer.service.type "LoadBalancer" }}:
+
+     kubectl get svc {{ include "isaaclab.fullname" . }}-viewer -n {{ .Release.Namespace }} \
+       -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+{{ if .Values.viewer.service.create }}
+   A CLB was provisioned for the page{{ with .Values.viewer.service.bandwidthMbps }} at {{ . }} Mbps{{ end }}. It is deleted with this release, so the
+   address does not survive a reinstall — bind an existing CLB (service.create=false,
+   service.existingId) if anybody needs to bookmark it.
+   It carries the PAGE ONLY — a few static files and two small JSON endpoints. Video never
+   touches it: the browser opens its WebSocket and its media straight to LiveKit, so the bandwidth
+   that matters for picture quality is LiveKit's CLB, not this one.
+{{- else }}
+   It was published on EXISTING CLB {{ .Values.viewer.service.existingId }}, port {{ .Values.viewer.service.port }}.
+
+   ⚠️ If that CLB was created by the CCM (i.e. it belongs to another Service), EXTERNAL-IP will
+   stay <pending> forever and the events will show `can not reuse clb ... which is created by
+   vke`. The page is still reachable — the listener and backend group are built — but Kubernetes
+   never reports the address. Use the CLB's own address, which you already know.
+
+   This release adds only the PAGE to that instance — static files and two small JSON endpoints.
+   Video never touches it; the browser talks to LiveKit directly.
+{{- end }}
+{{- else }} port {{ .Values.viewer.service.port }}, reachable only by port-forward (service.type is ClusterIP):
+
+     kubectl port-forward svc/{{ include "isaaclab.fullname" . }}-viewer {{ .Values.viewer.service.port }}:{{ .Values.viewer.service.port }} -n {{ .Release.Namespace }}
+{{- end }}
+
+   Sign in with the credentials in Secret {{ .Values.viewer.auth.existingSecret }}. The page is
+   published with HTTP Basic in front of it and cannot be opened without it.
+
+   ⚠️ Open it over http, not https, until LiveKit terminates TLS: an https page is not allowed to
+   open the plaintext ws:// connection the viewer needs.
 {{- end }}
 {{- end }}
