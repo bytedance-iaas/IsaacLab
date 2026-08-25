@@ -129,7 +129,7 @@ spec:
 
       containers:
         - name: viewer
-          image: "{{ $v.image.repository }}:{{ $v.image.tag }}"
+          image: "{{ $v.image.repository }}:{{ $v.image.tag | default $.Values.image.tag }}"
           imagePullPolicy: {{ $v.image.pullPolicy }}
           {{- if not $v.publicLivekitUrl }}
           {{/* Wraps the image's own CMD so the discovered address reaches server.py, which reads

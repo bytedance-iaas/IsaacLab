@@ -89,15 +89,10 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
      ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py \
        --task <task> --num_envs 16 --headless --stream
 
-   It publishes to room {{ include "isaaclab.stream.room" . }}. Demo use — keep num_envs small.
-
-   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
-      A run using it belongs on an instance type valid for BOTH modes.
+   It publishes to room {{ include "isaaclab.stream.room" . }}.
 {{- else if $lkurl }}
 
 3. Training can publish a live view to {{ $lkurl }} (room {{ include "isaaclab.stream.room" . }})
    by adding --stream to a run. That server is NOT managed by this release.
-
-   ⚠️ --stream renders a camera view, so it needs a GPU that can RENDER, not just compute.
 {{- end }}
 {{- end }}

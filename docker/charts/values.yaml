@@ -336,17 +336,18 @@ livekit:
 # Tied to livekit.enabled, because it signs those tokens with the LiveKit server's own Secret —
 # without a server there is nothing to sign for and nothing to watch.
 #
-# ⚠️ Its image is built and released SEPARATELY from the training image. That one is ~8.5 GB and
-#    this one is a slim Python base with no dependencies; a wording change on the page must not
-#    rebuild the training image, and the two move on different schedules.
+# ⚠️ Its image is built SEPARATELY from the training image — that one is ~8.5 GB and this is a
+#    slim Python base, so a wording change on the page must not rebuild it. They are still
+#    released together, which is why viewer.image.tag defaults to following image.tag; it exists
+#    for the times the two have to be pinned apart.
 viewer:
   # Requires livekit.enabled=true.
   enabled: false
 
   image:
     repository: iaas-us-cn-beijing.cr.volces.com/physicalai/isaaclab-viewer
-    # REQUIRED when enabled, and empty for the same reason as the training image: the chart does
-    # not track image versions.
+    # Empty means "follow image.tag" — both images come out of the same build and normally move
+    # together. Set it only to deliberately pin them apart.
     tag: ""
     pullPolicy: IfNotPresent
 

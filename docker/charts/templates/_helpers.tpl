@@ -173,9 +173,11 @@ lists every running training and plays it.
 {{- if not .Values.livekit.enabled }}
 {{- fail "viewer.enabled=true requires livekit.enabled=true: the viewer signs its tokens with the LiveKit server's Secret, so there is nothing to sign for without a server. To watch a server owned by another release, deploy the viewer from that release instead." }}
 {{- end }}
-{{- if not .Values.viewer.image.tag }}
-{{- fail "viewer.image.tag is required when viewer.enabled=true. The viewer image is built and released separately from the training image, so it has its own tag." }}
-{{- end }}
+{{/*
+No check on viewer.image.tag: empty means "follow image.tag", which is the common case since both
+images come out of the same build. image.tag itself is already required, so an empty pair cannot
+get through -- and the viewer keeps its own key for the times the two need to be pinned apart.
+*/}}
 {{- if not .Values.viewer.auth.existingSecret }}
 {{- fail "viewer.auth.existingSecret is required. The viewer is published with HTTP Basic authentication in front of it and there is no way to turn that off -- a page that enumerates every running training and plays it must not be open. Create the Secret first, in the release namespace:\n  kubectl create secret generic isaaclab-viewer-auth -n <namespace> --from-literal=username=<user> --from-literal=password='<password>'\nThe chart deliberately cannot create it from values, because Helm keeps values in the release history where the password would stay readable." }}
 {{- end }}
