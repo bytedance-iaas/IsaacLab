@@ -189,19 +189,20 @@ streaming:
     #    gets a VIP and the init container waits forever.
     subnetId: ""
 
-    # Public bandwidth cap, Mbps. THE PLATFORM DEFAULT IS 1 Mbps, which cannot carry video: the
-    # stream connects, ICE completes, and the picture is a slideshow or stalls outright. That
-    # failure looks like a broken stream rather than a capped link, so this is set explicitly.
+    # Public bandwidth cap, Mbps. THIS CHART DEFAULTS TO 10; the PLATFORM default, which applies
+    # if this is left unset, is 1 Mbps and cannot carry video -- the stream connects, ICE
+    # completes, and the picture is a slideshow or stalls outright. That failure looks like a
+    # broken stream rather than a capped link, which is why the chart sets it explicitly.
     #
     # 10 Mbps is a working floor for one 1080p session. Raise it for higher resolution, a higher
     # frame rate, or more than one concurrent viewer.
     #
     # ⚠️ Only applies when the chart CREATES the CLB. Binding to an existing one (create=false)
     #    inherits whatever that CLB was given — check it in the console.
-    # ⚠️ Verify after deploying. The CCM echoes these annotations back verbatim whether or not it
-    #    understands them, so a wrong key looks identical to a working one from kubectl. Both
-    #    documented spellings are sent for that reason; neither could be confirmed against the
-    #    vendor docs, and the authoritative reading is the EIP's bandwidth in the console.
+    # Both documented spellings of the annotation are sent, because the CCM echoes annotations
+    # back verbatim whether or not it understands them -- a wrong key is indistinguishable from a
+    # working one through the API, so there was no way to tell which one it reads. Confirmed
+    # working end to end: a release requesting 10 showed 10 Mbps on the EIP in the console.
     bandwidthMbps: 10
 
     # EIP billing. Empty leaves it to the platform, which is the right default: the two modes

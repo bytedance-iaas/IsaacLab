@@ -5,7 +5,7 @@ Isaac Lab is deployed as {{ $fullname }} in namespace {{ .Release.Namespace }}, 
 Pod:     {{ $fullname }}-0
 Storage: data-{{ $fullname }}-0 ({{ .Values.persistence.size }}, {{ .Values.persistence.storageClass }}) at {{ .Values.persistence.mountPath }}
 {{- if $render }}
-Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
+Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.loadBalancer.create }}new CLB, {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps{{ else }}CLB {{ .Values.streaming.loadBalancer.existingId }}, bandwidth as configured on it{{ end }}, {{ .Values.streaming.loadBalancer.addressType }})
 {{- end }}
 
 {{- if and $render (eq .Values.streaming.loadBalancer.addressType "PUBLIC") }}
@@ -55,30 +55,11 @@ Stream:  {{ include "isaaclab.streamServiceName" . }} ({{ if .Values.streaming.l
      kubectl logs {{ $fullname }}-0 -n {{ .Release.Namespace }} -c wait-clb-ip
 
    Point the Isaac Sim WebRTC Streaming Client at that address, port {{ .Values.streaming.signallingPort }}.
-{{- if .Values.streaming.loadBalancer.create }}
-
-   ⚠️ Check that CLB's public bandwidth in the console — the platform echoes the request back
-   whether or not it honoured it, so kubectl cannot tell you. The default it falls back to is
-   1 Mbps, which cannot carry video: the stream connects and then stalls. This release asked
-   for {{ .Values.streaming.loadBalancer.bandwidthMbps }} Mbps.
-{{- end }}
 {{- end }}
 
 3. Watch Isaac Sim start. It runs in the foreground, so its log is the container log:
 
      kubectl logs -f {{ $fullname }}-0 -n {{ .Release.Namespace }}
-
-   The UDP media port is bound lazily, at session setup, so it stays absent until the first
-   client connects — that is expected, not a fault. To check it once a client is connected,
-   without needing any tools in the image:
-
-     kubectl exec {{ $fullname }}-0 -n {{ .Release.Namespace }} -- \
-       sh -c 'grep -i ":$(printf %04X {{ .Values.streaming.mediaPort }}) " /proc/net/udp'
-
-   ⚠️ Connect with the Isaac Sim WebRTC Streaming Client — a browser cannot open this directly.
-   The signalling port speaks WebSocket rather than HTTP, and this Isaac Sim serves no client
-   page of its own: NVIDIA retired the extension that used to host one. Browser access would
-   need a front end built on the Omniverse WebRTC Streaming Library.
 {{- else }}
 
 2. Exec in and launch training:
