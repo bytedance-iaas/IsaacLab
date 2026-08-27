@@ -1,17 +1,17 @@
 """SO-101 pick-and-place: drop a cube into a bin standing on the table.
 
-Translated by hand from a scene authored in the Isaac Sim GUI (so101_pnp.usd), and written to be
-read as an example of that translation. A scene file carries geometry; a task also needs intent,
-so the numbers below fall into three kinds, and it is worth knowing which is which before copying
-this file for a scene of your own.
+Translated by hand from a scene authored in the Isaac Sim GUI (so101_pnp_example.usd), and written
+to be read as an example of that translation. A scene file carries geometry; a task also needs
+intent, so the numbers below fall into three kinds, and it is worth knowing which is which before
+copying this file for a scene of your own.
 
 Measured off the scene and the assets it references:
 
   ThorlabsTable   bbox x=[-0.1762, 0.7238]  y=[-0.3793, 0.3793]  z=[-0.7947, 0]
                   -> work surface sits exactly at z = 0, footprint 0.90 x 0.76
   DexCube         0.06 across, scaled 0.5 in the GUI scene -> a 3 cm cube
-  Poses           robot and table both at the origin (the scene authors no transform on either),
-                  cube at (0.20, 0, 0.015), bin at (0.18, -0.18, 0)
+  Poses           robot and table both at the origin, cube at (0.20, 0, 0.015),
+                  bin at (0.18, -0.18, 0)
 
 Those poses are worth dwelling on, because they fix the frame everything else is written in: the
 robot sits at the origin and the work is at +X, which is exactly where the stock SO_ARM101_CFG
@@ -30,8 +30,9 @@ recorded a few lines above disproved the assumption the whole time.
 So: measure the asset, then reason from the measurement, not from what the placement looks like it
 implies. If a scene seems to need fixing before it can be translated, suspect the reading first.
 
-Every pose here is the authored one, and both props keep the authored asset or its measured
-dimensions, so a viewer watching the training stream sees the scene that was built, not a
+Every placement here is the authored one, apart from two deliberate departures noted below: the
+robot's orientation, and the bin's height off the table. Both props keep the authored asset or its
+measured dimensions, so a viewer watching the training stream sees the scene that was built, not a
 rearrangement of it. Three things still had to be decided, and each has a reason the scene file
 could not carry:
 
@@ -142,7 +143,7 @@ COLOUR_BIN_IN = (0.50, 0.31, 0.46)
 
 
 def _wall(name: str, dx: float, dy: float, sx: float, sy: float) -> AssetBaseCfg:
-    """One static black bin wall, positioned relative to the bin centre.
+    """One static bin wall, positioned relative to the bin centre.
 
     Prim paths are flat: Isaac Lab spawns straight onto the given path and will
     not create intermediate Xforms, so a nested ".../Bin/Wall" would fail with
@@ -170,9 +171,9 @@ def _wall(name: str, dx: float, dy: float, sx: float, sy: float) -> AssetBaseCfg
 class PnPSceneCfg(InteractiveSceneCfg):
     """Table with a bin on it, plus the robot and the cube it has to move."""
 
-    # Stock config, unmodified: it rests the arm stretched along +X, which is where the scene
-    # author put the work -- so the arm faces the bin and the cube from the first frame with no
-    # override needed.
+    # Stock config, unmodified. The scene rotates its robot 90 degrees, and that rotation is
+    # deliberately not copied here: the scene uses NVIDIA's RobotStudio USD, whose zero pose points
+    # -Y, while this config builds the arm from URDF, whose zero already points +X.
     robot: ArticulationCfg = SO_ARM101_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # White table with a dark frame -- exactly as the GUI authored it, at the origin.
@@ -197,7 +198,8 @@ class PnPSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    # Bin floor, white, sitting on the table surface.
+    # Bin floor, sitting on the table surface. Lighter than the walls so the drop target reads
+    # clearly from the training view.
     bin_floor = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/BinFloor",
         init_state=AssetBaseCfg.InitialStateCfg(pos=(BIN_XY[0], BIN_XY[1], BIN_FLOOR_T / 2)),

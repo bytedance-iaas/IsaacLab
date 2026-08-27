@@ -170,7 +170,5 @@ kubectl cp isaac-train-0:<训练目录>/exported ./exported
 **[本机]**
 
 ```bash
-kubectl cp isaac-render-0:/data/so101_pnp.usda ./so101_pnp.usda
+kubectl cp isaac-render-0:/root/so101_pnp_example.usd ./so101_pnp_example.usd
 ```
-
-仅持久盘目录（默认 `/data`）中的内容会在容器重建后保留。
