@@ -183,7 +183,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         livekit_stream.add_stream_camera(env_cfg)
 
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if (args_cli.video or args_cli.stream) else None)
 
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):

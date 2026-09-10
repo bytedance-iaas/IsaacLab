@@ -11,10 +11,18 @@ arm task, so on any other robot or terrain it pointed at empty space -- a second
 nothing is worse than no second pane. The panorama derives its framing from the env grid, so it
 adapts on its own.
 
-- Frames are read back (GPU to CPU) in the main thread's app update callback; touching CUDA from
-  another thread causes an illegal memory access.
+- Frames come from the env's own single-viewport render() -- the same machinery --video uses --
+  not from per-env Camera sensors. A per-env camera was the original design, and it broke on any
+  task whose scene has no other USD sensors: physics-replication cloning does not copy the camera
+  prim into env_1..N, leaving a 1-instance sensor that the scene reset then indexes with N env
+  ids (CUDA index-out-of-bounds at startup). One viewport also removes the "small --num_envs
+  only" restriction that per-env cameras imposed.
+- Frames are captured on the training thread, right after each env.step, by wrapping the
+  wrapper's step() -- the same place RecordVideo captures from. A kit update-event callback was
+  tried first and silently produced no frames: the headless training loop does not render per
+  step, and triggering a render from inside the update callback does not work.
 - The LiveKit thread only reads CPU frames and publishes the video track "pano".
-- Called from train.py --stream.
+- Called from train.py --stream. Requires the env to be created with render_mode="rgb_array".
 """
 
 from __future__ import annotations
@@ -27,9 +35,6 @@ import time
 
 import numpy as np
 import torch
-
-import isaaclab.sim as sim_utils
-from isaaclab.sensors import CameraCfg
 
 # Where to publish. These are configuration, not constants: a deployment that is not ours has its
 # own LiveKit, and a run that hardcodes ours would either fail to connect or -- worse -- succeed,
@@ -84,38 +89,21 @@ DEFAULT_ROOM = default_room()
 PANO_W, PANO_H = 960, 540  # panorama resolution
 
 
-def _cam(prim, w, h):
-    # No offset: the pose is set from the env grid once the scene exists, which is the only way to
-    # frame a layout whose size is not known until then.
-    return CameraCfg(
-        prim_path=prim,
-        height=h,
-        width=w,
-        data_types=["rgb"],
-        # Far plane 1000, not 30: the camera pulls back to frame the whole env grid, and on a
-        # generated rough terrain that puts the ground tens of metres away. With a 30 m far plane
-        # everything but the sky got clipped, and the stream showed a gradient over nothing.
-        spawn=sim_utils.PinholeCameraCfg(focal_length=18.0, clipping_range=(0.05, 1000.0)),
-    )
-
-
 def add_stream_camera(env_cfg):
-    """Add the panorama camera to the scene before the env is created, and disable the debug
-    markers."""
+    """Prepare the env config for streaming: set the viewer resolution the render product will
+    use, and disable the debug markers so they do not litter the picture.
+
+    Deliberately does NOT add a camera to the scene. The stream is one view, so it uses the
+    env's built-in viewer camera through render(); see the module docstring for why per-env
+    scene cameras were removed.
+    """
     for grp in ("commands", "scene"):
         obj = getattr(env_cfg, grp, None)
         if obj is not None:
             for term in vars(obj).values():
                 if hasattr(term, "debug_vis"):
                     term.debug_vis = False
-    env_cfg.scene.stream_pano = _cam("{ENV_REGEX_NS}/stream_pano", PANO_W, PANO_H)
-
-
-def _set_pose(cam, eye, target, device, n):
-    cam.set_world_poses_from_view(
-        eyes=torch.tensor([list(eye)], device=device, dtype=torch.float32).repeat(n, 1),
-        targets=torch.tensor([list(target)], device=device, dtype=torch.float32).repeat(n, 1),
-    )
+    env_cfg.viewer.resolution = (PANO_W, PANO_H)
 
 
 def start_publisher(
@@ -133,8 +121,6 @@ def start_publisher(
 
     from livekit import api, rtc
 
-    import omni.kit.app
-
     if not key or not secret:
         # Say so and carry on: --stream is a convenience, and losing the training run because the
         # credentials for the video feed are missing would be the wrong trade.
@@ -147,8 +133,32 @@ def start_publisher(
 
     unwrapped = env.unwrapped
     device = unwrapped.device
-    n = unwrapped.num_envs
-    pano_cam = unwrapped.scene["stream_pano"]
+
+    # The frame source is env.render(), which only produces pixels when the env was created with
+    # render_mode="rgb_array" (train.py sets this for --stream). Anything else means a wiring
+    # mistake; say so in one readable line instead of failing later with something cryptic.
+    if getattr(unwrapped, "render_mode", None) != "rgb_array":
+        print(
+            "[livekit] env render_mode is not 'rgb_array', so no video will be published."
+            " Training continues normally.",
+            flush=True,
+        )
+        return
+
+    def _look(eye, target):
+        """Point the viewer camera. The controller exists whenever rendering does; keep a direct
+        fallback for the odd configuration where it does not."""
+        ctrl = getattr(unwrapped, "viewport_camera_controller", None)
+        if ctrl is not None:
+            ctrl.update_view_location(eye=[float(x) for x in eye], lookat=[float(x) for x in target])
+        else:
+            from isaacsim.core.utils.viewports import set_camera_view
+
+            set_camera_view(
+                eye=[float(x) for x in eye],
+                target=[float(x) for x in target],
+                camera_prim_path=unwrapped.cfg.viewer.cam_prim_path,
+            )
 
     # Initial pose from the env grid, so there is a sensible view before the first frame.
     origins = unwrapped.scene.env_origins.float()
@@ -158,7 +168,7 @@ def start_publisher(
     pano_eye = (center + torch.tensor([0.0, -d, d * 0.85 + 1.5], device=device)).tolist()
     pano_target = (center + torch.tensor([0.0, 0.0, 0.15], device=device)).tolist()
     try:
-        _set_pose(pano_cam, pano_eye, pano_target, device, n)
+        _look(pano_eye, pano_target)
         print(f"[livekit] camera ready, panorama eye={[round(x, 2) for x in pano_eye]}", flush=True)
     except Exception as e:  # noqa: BLE001
         print("[livekit] failed to set camera pose:", e, flush=True)
@@ -187,38 +197,64 @@ def start_publisher(
         dd = ss * 0.65 + 2.0
         eye = cs + torch.tensor([0.0, -dd, dd * 0.85 + 1.5], device=device)
         tgt = cs + torch.tensor([0.0, 0.0, 0.15], device=device)
-        pano_cam.set_world_poses_from_view(eyes=eye.unsqueeze(0).repeat(n, 1), targets=tgt.unsqueeze(0).repeat(n, 1))
+        _look(eye.tolist(), tgt.tolist())
 
-    # "sub" holds the update subscription: dropping the handle would let it be collected and the
-    # capture callback would stop firing.
-    shared = {"pano": None, "sub": None}
+    shared = {"pano": None, "frames": 0}
     period = 1.0 / fps
     last = [0.0]
 
-    def _grab(cam):
-        out = cam.data.output.get("rgb")
-        if out is None or out.shape[0] == 0:
+    _size_warned = [False]
+
+    def _grab():
+        rgb = unwrapped.render()
+        if rgb is None:
             return None
-        rgb = out[0].detach().cpu().numpy()
+        rgb = np.asarray(rgb)
+        if rgb.shape[:2] != (PANO_H, PANO_W):
+            # The render product was created at viewer.resolution; a mismatch means someone else
+            # overrode it after add_stream_camera. Publishing a wrong-sized buffer would garble
+            # the video, so warn once and skip.
+            if not _size_warned[0]:
+                print(f"[livekit] unexpected frame size {rgb.shape[:2]}, expected {(PANO_H, PANO_W)}", flush=True)
+                _size_warned[0] = True
+            return None
         if rgb.shape[-1] == 3:
             rgb = np.dstack([rgb, np.full(rgb.shape[:2], 255, np.uint8)])
         return np.ascontiguousarray(rgb.astype(np.uint8))
 
-    def _on_update(_e):
+    _err_once = [False]
+
+    def _capture():
         now = time.time()
         if now - last[0] < period:
             return
         try:
             if robot is not None:
                 _follow_cam()
-            shared["pano"] = _grab(pano_cam)
+            frame = _grab()
+            if frame is not None:
+                if shared["frames"] == 0:
+                    print(f"[livekit] first frame captured {frame.shape[1]}x{frame.shape[0]}", flush=True)
+                shared["pano"] = frame
+                shared["frames"] += 1
             last[0] = now
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            # Losing the stream must not lose the run -- but losing it silently must not
+            # happen either. Say what broke, once.
+            if not _err_once[0]:
+                print("[livekit] frame capture failed:", repr(e), flush=True)
+                _err_once[0] = True
 
-    shared["sub"] = (
-        omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(_on_update, name="livekit-capture")
-    )
+    # Capture from the training thread, after each step: wrap the outermost env's step so the
+    # render happens where RecordVideo's does -- on the main thread, after physics advanced.
+    _orig_step = env.step
+
+    def _step_and_capture(*args, **kwargs):
+        out = _orig_step(*args, **kwargs)
+        _capture()
+        return out
+
+    env.step = _step_and_capture
 
     def _lk_thread():
         loop = asyncio.new_event_loop()
