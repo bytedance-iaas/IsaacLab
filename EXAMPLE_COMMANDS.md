@@ -90,8 +90,6 @@ setsid nohup ./isaaclab.sh -p scripts/reinforcement_learning/rsl_rl/train.py --t
 grep -aF "[livekit]" /workspace/stream.log | tail -2
 ```
 
-`--stream` 会开启相机渲染，`--num_envs` 应保持在几十以内。
-
 ## 训练产物
 
 诊断报告：
