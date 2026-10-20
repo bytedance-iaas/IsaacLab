@@ -14,7 +14,11 @@ __all__ = [
     "RslRlBaseRunnerCfg",
     "RslRlCNNModelCfg",
     "RslRlMLPModelCfg",
+    "RslRlOffPolicyRunnerCfg",
     "RslRlOnPolicyRunnerCfg",
+    "RslRlSacActorModelCfg",
+    "RslRlSacAlgorithmCfg",
+    "RslRlSacCriticModelCfg",
     "RslRlPpoActorCriticCfg",
     "RslRlPpoActorCriticRecurrentCfg",
     "RslRlPpoAlgorithmCfg",
@@ -35,11 +39,15 @@ from .rl_cfg import (
     RslRlBaseRunnerCfg,
     RslRlCNNModelCfg,
     RslRlMLPModelCfg,
+    RslRlOffPolicyRunnerCfg,
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
     RslRlPpoActorCriticRecurrentCfg,
     RslRlPpoAlgorithmCfg,
     RslRlRNNModelCfg,
+    RslRlSacActorModelCfg,
+    RslRlSacAlgorithmCfg,
+    RslRlSacCriticModelCfg,
 )
 from .rnd_cfg import RslRlRndCfg
 from .symmetry_cfg import RslRlSymmetryCfg

@@ -1,0 +1,2016 @@
+diff -ruN pa/rsl_rl/algorithms/__init__.py pb/rsl_rl/algorithms/__init__.py
+--- pa/rsl_rl/algorithms/__init__.py	2026-10-19 22:49:31
++++ pb/rsl_rl/algorithms/__init__.py	2026-10-19 22:49:31
+@@ -9,3 +9,6 @@
+ from .ppo import PPO
+ 
+ __all__ = ["PPO", "Distillation"]
++
++from .sac import SAC
++__all__ = list(__all__) + ["SAC"]
+diff -ruN pa/rsl_rl/algorithms/sac.py pb/rsl_rl/algorithms/sac.py
+--- pa/rsl_rl/algorithms/sac.py	1969-12-31 16:00:00
++++ pb/rsl_rl/algorithms/sac.py	2026-10-19 22:49:31
+@@ -0,0 +1,681 @@
++# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++from __future__ import annotations
++
++import torch
++import torch.nn as nn
++import torch.optim as optim
++from tensordict import TensorDict
++
++from rsl_rl.env import VecEnv
++from rsl_rl.extensions import RandomNetworkDistillation, resolve_rnd_config, resolve_symmetry_config
++from rsl_rl.models import SACActorModel, SACCriticModel
++from rsl_rl.storage import ReplayBuffer
++from rsl_rl.utils import resolve_callable, resolve_obs_groups, resolve_optimizer
++
++
++class SAC:
++    """Soft Actor-Critic algorithm (https://arxiv.org/abs/1812.05905).
++
++    Uses separate actor and critic models following the v4.0.0 architecture.
++    """
++
++    actor: SACActorModel
++    """The actor model."""
++
++    critic: SACCriticModel
++    """The critic model."""
++
++    def __init__(
++        self,
++        actor: SACActorModel,
++        critic: SACCriticModel,
++        replay_buffer: ReplayBuffer,
++        replay_buffer_size: int = 1_000_000,
++        num_learning_epochs: int = 1,
++        num_mini_batches: int = 1,
++        mini_batch_size: int = 256,
++        actor_learning_rate: float = 1e-3,
++        critic_learning_rate: float = 1e-3,
++        alpha_learning_rate: float = 1e-3,
++        actor_optimizer: str = "adam",
++        critic_optimizer: str = "adam",
++        auto_alpha: bool = True,
++        alpha: float = 0.05,
++        tau: float = 0.005,
++        gamma: float = 0.998,
++        target_entropy_scale: float = 1.0,
++        device: str = "cpu",
++        max_grad_norm: float = 1.0,
++        policy_frequency: int = 2,
++        n_steps: int = 1,
++        # RND parameters
++        rnd_cfg: dict | None = None,
++        # Symmetry parameters
++        symmetry_cfg: dict | None = None,
++        # Distributed training parameters
++        multi_gpu_cfg: dict | None = None,
++    ):
++        """Initialize the SAC algorithm.
++
++        Args:
++            actor: The SAC actor model.
++            critic: The SAC critic model.
++            replay_buffer: An instance of the ReplayBuffer class.
++            replay_buffer_size: Max replay buffer size.
++            num_learning_epochs: How many epochs to run each update.
++            num_mini_batches: Into how many mini-batches to split the replay data per epoch.
++            mini_batch_size: Mini-batch size for updates.
++            actor_learning_rate: LR for the actor parameters.
++            critic_learning_rate: LR for the critic parameters.
++            alpha_learning_rate: LR for the alpha parameter, if auto_alpha=True.
++            actor_optimizer: Optimizer name for the actor (e.g., "adam", "adamw").
++            critic_optimizer: Optimizer name for the critic (e.g., "adam", "adamw").
++            auto_alpha: Whether to learn alpha automatically.
++            alpha: Initial temperature (if auto_alpha=False) or initial value for alpha learning.
++            tau: Soft update coefficient for target networks.
++            gamma: Discount factor.
++            target_entropy_scale: Scale factor for target entropy; target_entropy = -scale * action_dim.
++            device: 'cpu' or 'cuda'.
++            max_grad_norm: Max norm for gradient clipping.
++            policy_frequency: Frequency of actor updates relative to critic updates.
++            n_steps: Number of steps for n-step returns (default: 1).
++            rnd_cfg: Optional dictionary of RND configuration parameters. If None, RND is not used.
++            symmetry_cfg: Optional dictionary of symmetry configuration parameters. If None, symmetry is not used.
++            multi_gpu_cfg: Optional dictionary of multi-GPU configuration parameters. If None, multi-GPU is not used.
++        """
++        self.device = device
++        self.is_multi_gpu = multi_gpu_cfg is not None
++        # Multi-GPU parameters
++        if multi_gpu_cfg is not None:
++            self.gpu_global_rank = multi_gpu_cfg["global_rank"]
++            self.gpu_world_size = multi_gpu_cfg["world_size"]
++        else:
++            self.gpu_global_rank = 0
++            self.gpu_world_size = 1
++
++        # RND components
++        if rnd_cfg:
++            rnd_lr = rnd_cfg.pop("learning_rate", 1e-3)
++            self.rnd = RandomNetworkDistillation(device=self.device, **rnd_cfg)
++            self.rnd_optimizer = optim.Adam(self.rnd.predictor.parameters(), lr=rnd_lr)
++        else:
++            self.rnd = None
++            self.rnd_optimizer = None
++
++        # Symmetry components
++        if symmetry_cfg is not None:
++            use_symmetry = symmetry_cfg["use_data_augmentation"] or symmetry_cfg["use_mirror_loss"]
++            if not use_symmetry:
++                print("Symmetry not used for learning. We will use it for logging instead.")
++            symmetry_cfg["data_augmentation_func"] = resolve_callable(symmetry_cfg["data_augmentation_func"])
++            if not callable(symmetry_cfg["data_augmentation_func"]):
++                raise ValueError(
++                    "Symmetry configuration exists but the function is not callable:"
++                    f" {symmetry_cfg['data_augmentation_func']}"
++                )
++            if actor.is_recurrent or critic.is_recurrent:
++                raise ValueError("Symmetry augmentation is not supported for recurrent policies.")
++            self.symmetry = symmetry_cfg
++        else:
++            self.symmetry = None
++
++        # Store actor and critic
++        self.actor = actor.to(device)
++        self.critic = critic.to(device)
++
++        # Replay buffer
++        self.replay_buffer = replay_buffer
++        self.replay_buffer_size = replay_buffer_size
++        self.transition = ReplayBuffer.Transition()
++
++        # SAC hyperparams
++        self.num_learning_epochs = num_learning_epochs
++        self.num_mini_batches = num_mini_batches
++        self.mini_batch_size = mini_batch_size
++        self.gamma = gamma
++        self.tau = tau
++        self.auto_alpha = auto_alpha
++        self.alpha = alpha
++        self.actor_learning_rate = actor_learning_rate
++        self.critic_learning_rate = critic_learning_rate
++        self.alpha_learning_rate = alpha_learning_rate
++        self.policy_frequency = policy_frequency
++        self.update_step = 0
++        self.n_steps = n_steps
++        self.max_grad_norm = max_grad_norm
++
++        self.target_entropy = -target_entropy_scale * self.actor.output_dim
++
++        # Initialize log_alpha and its optimizer
++        if self.auto_alpha:
++            self.log_alpha = torch.log(torch.tensor(self.alpha, device=self.device)).detach().clone().requires_grad_(True)
++            self.alpha_optimizer = optim.Adam([self.log_alpha], lr=self.alpha_learning_rate)
++        else:
++            self.log_alpha = (
++                torch.log(torch.tensor(self.alpha, device=self.device)).detach().clone().requires_grad_(False)
++            )
++            self.alpha_optimizer = None
++
++        # Collect trainable parameters (target network params have requires_grad=False, auto-excluded)
++        self.actor_parameters = [p for p in self.actor.parameters() if p.requires_grad]
++        self.critic_parameters = [p for p in self.critic.parameters() if p.requires_grad]
++
++        # Create optimizers using resolve_optimizer (matching PPO pattern)
++        self.actor_optimizer = resolve_optimizer(actor_optimizer)(
++            self.actor_parameters, lr=self.actor_learning_rate
++        )
++        self.critic_optimizer = resolve_optimizer(critic_optimizer)(
++            self.critic_parameters, lr=self.critic_learning_rate
++        )
++
++        # Init target networks
++        self.critic.init_target_networks()
++
++    def act(self, obs: TensorDict) -> torch.Tensor:
++        """Select an action using the actor (stochastic during training)."""
++        with torch.no_grad():
++            action = self.actor(obs, stochastic_output=True)
++            self.transition.observations = obs
++            self.transition.actions = action
++            return action
++
++    def process_env_step(
++        self, next_obs: TensorDict, rew: torch.Tensor, dones: torch.Tensor, extras: dict
++    ) -> None:
++        """Process a single environment step and store transition in replay buffer."""
++        if "time_outs" in extras and "time_outs_obs" in extras:
++            time_outs = extras["time_outs"].int().to(self.device)
++            time_outs_obs = extras.get("time_outs_obs", None)
++            true_next_obs = {}
++            mask = time_outs.squeeze(-1).bool()
++
++            for key in time_outs_obs.keys():
++                true_next_obs[key] = torch.where(mask[:, None], time_outs_obs[key], next_obs[key])
++            true_next_obs = TensorDict(true_next_obs, batch_size=next_obs.batch_size)
++        else:
++            time_outs = torch.zeros_like(dones, device=self.device)
++            true_next_obs = next_obs
++
++        # Update normalizers
++        self.actor.update_normalization(true_next_obs)
++        self.critic.update_normalization(true_next_obs)
++        if self.rnd:
++            self.rnd.update_normalization(true_next_obs)
++
++        # Compute intrinsic rewards and add to extrinsic rewards
++        if self.rnd:
++            self.intrinsic_rewards = self.rnd.get_intrinsic_reward(true_next_obs)
++            rew += self.intrinsic_rewards
++
++        # Record transition and insert into replay buffer
++        self.transition.rewards = rew
++        self.transition.next_observations = true_next_obs
++        self.transition.dones = dones
++        self.transition.bootstrap = time_outs
++
++        self.replay_buffer.add_transition(self.transition)
++        self.transition.clear()
++        self.actor.reset(dones)
++
++    def update(self) -> dict:
++        """Perform off-policy SAC updates, returning mean losses."""
++        mean_critic1_loss = 0.0
++        mean_critic2_loss = 0.0
++        mean_actor_loss = 0.0
++        mean_alpha_loss = 0.0
++        mean_rnd_loss = 0.0 if self.rnd else None
++        mean_symmetry_loss = 0.0 if self.symmetry else None
++
++        for batch in self.replay_buffer.mini_batch_generator(
++            num_mini_batch=self.num_mini_batches,
++            mini_batch_size=self.mini_batch_size,
++            num_epochs=self.num_learning_epochs,
++        ):
++            (
++                obs_batch,
++                actions_batch,
++                rewards_batch,
++                next_obs_batch,
++                dones_batch,
++                bootstrap_batch,
++                effective_n_steps,
++            ) = batch
++
++            original_batch_size = (
++                obs_batch.batch_size[0] if isinstance(obs_batch, TensorDict) else obs_batch.shape[0]
++            )
++
++            num_aug = 1
++            # Perform symmetric augmentation
++            if self.symmetry and self.symmetry["use_data_augmentation"]:
++                original_batch_size = (
++                    obs_batch.batch_size[0] if isinstance(obs_batch, TensorDict) else obs_batch.shape[0]
++                )
++                data_augmentation_func = self.symmetry["data_augmentation_func"]
++                obs_batch, actions_batch = data_augmentation_func(
++                    obs=obs_batch, actions=actions_batch, env=self.symmetry["_env"]
++                )
++                next_obs_batch, _ = data_augmentation_func(
++                    obs=next_obs_batch, actions=None, env=self.symmetry["_env"]
++                )
++                aug_batch_size = (
++                    obs_batch.batch_size[0] if isinstance(obs_batch, TensorDict) else obs_batch.shape[0]
++                )
++                num_aug = int(aug_batch_size / original_batch_size)
++                rewards_batch = rewards_batch.repeat(num_aug, *([1] * (rewards_batch.ndim - 1)))
++                dones_batch = dones_batch.repeat(num_aug, *([1] * (dones_batch.ndim - 1)))
++                bootstrap_batch = bootstrap_batch.repeat(num_aug, *([1] * (bootstrap_batch.ndim - 1)))
++                effective_n_steps = effective_n_steps.repeat(num_aug, *([1] * (effective_n_steps.ndim - 1)))
++
++            ###########################################################################
++            # 1) Critic update
++            with torch.no_grad():
++                bootstrap_mask = bootstrap_batch + 1 - dones_batch
++                if torch.any(bootstrap_mask > 1):
++                    raise ValueError("bootstrap_mask has values greater than 1. Check bootstrapping logic.")
++
++                new_actions, next_log_prob = self.actor.sample_action_logp(next_obs_batch)
++                next_state_entropy = -self.log_alpha.exp() * next_log_prob
++
++                q1_target, q2_target = self.critic.evaluate_all_target_q(next_obs_batch, new_actions)
++                min_target_q = torch.min(q1_target, q2_target)
++                q_target_next = min_target_q + next_state_entropy
++                n_step_discount = torch.pow(self.gamma, effective_n_steps.to(dtype=q_target_next.dtype))
++                target_q = rewards_batch + n_step_discount * bootstrap_mask * q_target_next
++
++            q1_pred, q2_pred = self.critic.evaluate_all_q(obs_batch, actions_batch)
++
++            critic1_loss = nn.functional.mse_loss(q1_pred, target_q)
++            critic2_loss = nn.functional.mse_loss(q2_pred, target_q)
++
++            total_critic_loss = 0.5 * (critic1_loss + critic2_loss)
++            self.critic_optimizer.zero_grad()
++            total_critic_loss.backward()
++
++            if self.is_multi_gpu:
++                self.reduce_parameters(self.critic_parameters)
++
++            torch.nn.utils.clip_grad_norm_(self.critic_parameters, self.max_grad_norm)
++            self.critic_optimizer.step()
++
++            ###########################################################################
++            # Sample new actions for actor and alpha update
++            new_actions, log_prob = self.actor.sample_action_logp(obs_batch)
++
++            ###########################################################################
++            # 2) Alpha update
++            if self.auto_alpha:
++                alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
++                self.alpha_optimizer.zero_grad()
++                alpha_loss.backward()
++
++                if self.is_multi_gpu:
++                    if self.log_alpha.grad is not None:
++                        torch.distributed.all_reduce(self.log_alpha.grad, op=torch.distributed.ReduceOp.SUM)
++                        self.log_alpha.grad /= self.gpu_world_size
++
++                self.alpha_optimizer.step()
++                self.alpha = self.log_alpha.exp().item()
++            else:
++                alpha_loss = torch.tensor(0.0, device=self.device)
++
++            entropy = self.log_alpha.exp().detach() * log_prob
++
++            ###########################################################################
++            # 3) Actor update
++            if self.update_step % self.policy_frequency == 0:
++                # Freeze critic parameters for actor update
++                for p in self.critic_parameters:
++                    p.requires_grad_(False)
++
++                q1, q2 = self.critic.evaluate_all_q(obs_batch, new_actions)
++                q_new = torch.min(q1, q2)
++                actor_loss = (entropy - q_new).mean()
++
++                # Symmetry loss
++                if self.symmetry:
++                    if not self.symmetry["use_data_augmentation"]:
++                        data_augmentation_func = self.symmetry["data_augmentation_func"]
++                        obs_batch, _ = data_augmentation_func(
++                            obs=obs_batch, actions=None, env=self.symmetry["_env"]
++                        )
++                        num_aug = int(
++                            (obs_batch.batch_size[0] if isinstance(obs_batch, TensorDict) else obs_batch.shape[0])
++                            / original_batch_size
++                        )
++
++                    # Deterministic mean actions for symmetry loss
++                    mean_actions_batch = self.actor(obs_batch.detach().clone())
++
++                    action_mean_orig = mean_actions_batch[:original_batch_size]
++                    _, actions_mean_symm_batch = data_augmentation_func(
++                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"]
++                    )
++
++                    if num_aug > 1:
++                        mse_loss = torch.nn.MSELoss()
++                        symmetry_loss = mse_loss(
++                            mean_actions_batch[original_batch_size:],
++                            actions_mean_symm_batch.detach()[original_batch_size:],
++                        )
++                        if self.symmetry["use_mirror_loss"]:
++                            actor_loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
++                        else:
++                            symmetry_loss = symmetry_loss.detach()
++                    else:
++                        symmetry_loss = torch.tensor(0.0, device=self.device)
++                else:
++                    symmetry_loss = torch.tensor(0.0, device=self.device)
++
++                self.actor_optimizer.zero_grad()
++                actor_loss.backward()
++
++                if self.is_multi_gpu:
++                    self.reduce_parameters(self.actor_parameters)
++
++                torch.nn.utils.clip_grad_norm_(self.actor_parameters, self.max_grad_norm)
++                self.actor_optimizer.step()
++
++                # Unfreeze critic parameters after actor update
++                for p in self.critic_parameters:
++                    p.requires_grad_(True)
++            else:
++                actor_loss = torch.tensor(0.0, device=self.device)
++                symmetry_loss = torch.tensor(0.0, device=self.device)
++
++            ###########################################################################
++            # 4) Soft update target networks
++            with torch.no_grad():
++                self.critic.soft_update_target_networks(self.tau)
++
++            # RND loss
++            if self.rnd:
++                with torch.no_grad():
++                    rnd_state_batch = self.rnd.get_rnd_state(obs_batch[:original_batch_size])
++                    rnd_state_batch = self.rnd.state_normalizer(rnd_state_batch)
++                predicted_embedding = self.rnd.predictor(rnd_state_batch)
++                target_embedding = self.rnd.target(rnd_state_batch).detach()
++                mseloss = torch.nn.MSELoss()
++                rnd_loss = mseloss(predicted_embedding, target_embedding)
++
++                self.rnd_optimizer.zero_grad()
++                rnd_loss.backward()
++                if self.is_multi_gpu:
++                    self.reduce_parameters(self.rnd.parameters())
++                self.rnd_optimizer.step()
++
++            # Accumulate losses
++            mean_critic1_loss += critic1_loss.item()
++            mean_critic2_loss += critic2_loss.item()
++            mean_actor_loss += actor_loss.item()
++            mean_alpha_loss += alpha_loss.item()
++            if mean_rnd_loss is not None:
++                mean_rnd_loss += rnd_loss.item()
++            if mean_symmetry_loss is not None:
++                mean_symmetry_loss += symmetry_loss.item()
++            self.update_step += 1
++
++        # Average losses
++        num_updates = self.num_learning_epochs * self.num_mini_batches
++        mean_critic1_loss /= num_updates
++        mean_critic2_loss /= num_updates
++        mean_actor_loss /= max((num_updates // self.policy_frequency), 1)
++        mean_alpha_loss /= num_updates
++        if mean_rnd_loss is not None:
++            mean_rnd_loss /= num_updates
++        if mean_symmetry_loss is not None:
++            mean_symmetry_loss /= max((num_updates // self.policy_frequency), 1)
++
++        loss_dict = {
++            "critic1": mean_critic1_loss,
++            "critic2": mean_critic2_loss,
++            "actor": mean_actor_loss,
++            "alpha": mean_alpha_loss,
++        }
++        if self.rnd:
++            loss_dict["rnd"] = mean_rnd_loss
++        if self.symmetry:
++            loss_dict["symmetry"] = mean_symmetry_loss
++
++        return loss_dict
++
++    def train_mode(self) -> None:
++        """Set actor, critic, and RND to training mode."""
++        self.actor.train()
++        self.critic.train()
++        if self.rnd:
++            self.rnd.train()
++
++    def eval_mode(self) -> None:
++        """Set actor, critic, and RND to evaluation mode."""
++        self.actor.eval()
++        self.critic.eval()
++        if self.rnd:
++            self.rnd.eval()
++
++    def get_policy(self) -> SACActorModel:
++        """Get the policy model (actor)."""
++        return self.actor
++
++    def save(self) -> dict:
++        """Return a dict of all model states for saving."""
++        saved_dict = {
++            "actor_state_dict": self.actor.state_dict(),
++            "critic_state_dict": self.critic.state_dict(),
++            "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
++            "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
++            "log_alpha": self.log_alpha.detach().cpu() if self.auto_alpha else None,
++            "alpha": self.alpha if not self.auto_alpha else None,
++        }
++        if self.auto_alpha and self.alpha_optimizer is not None:
++            saved_dict["alpha_optimizer_state_dict"] = self.alpha_optimizer.state_dict()
++        if self.rnd:
++            saved_dict["rnd_state_dict"] = self.rnd.state_dict()
++            if self.rnd_optimizer:
++                saved_dict["rnd_optimizer_state_dict"] = self.rnd_optimizer.state_dict()
++        return saved_dict
++
++    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
++        """Load specified models from a saved dict.
++
++        Args:
++            loaded_dict: Dictionary of saved model states.
++            load_cfg: Dictionary specifying which components to load. If None, loads all.
++            strict: Whether to strictly enforce state dict key matching.
++
++        Returns:
++            Whether the iteration counter should be restored.
++        """
++        if load_cfg is None:
++            load_cfg = {
++                "actor": True,
++                "critic": True,
++                "optimizer": True,
++                "iteration": True,
++                "rnd": True,
++            }
++
++        if load_cfg.get("actor"):
++            self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
++        if load_cfg.get("critic"):
++            self.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
++        if load_cfg.get("optimizer"):
++            self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
++            self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
++            if self.auto_alpha and "alpha_optimizer_state_dict" in loaded_dict:
++                self.alpha_optimizer.load_state_dict(loaded_dict["alpha_optimizer_state_dict"])
++            if loaded_dict.get("log_alpha") is not None:
++                self.log_alpha.data.copy_(loaded_dict["log_alpha"].to(self.device))
++                self.alpha = self.log_alpha.exp().item()
++            elif loaded_dict.get("alpha") is not None:
++                self.alpha = loaded_dict["alpha"]
++        if load_cfg.get("rnd") and self.rnd:
++            self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
++            if self.rnd_optimizer and "rnd_optimizer_state_dict" in loaded_dict:
++                self.rnd_optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
++        return load_cfg.get("iteration", False)
++
++    def clear_storage(self) -> None:
++        """Clear the replay buffer."""
++        if self.replay_buffer is not None:
++            self.replay_buffer.clear()
++
++    @staticmethod
++    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> SAC:
++        """Construct the SAC algorithm with actor, critic, and replay buffer.
++
++        Args:
++            obs: Initial observations from the environment.
++            env: The vectorized environment.
++            cfg: Configuration dictionary.
++            device: Device to place models on.
++
++        Returns:
++            Initialized SAC algorithm instance.
++        """
++        # Resolve class callables
++        alg_class: type[SAC] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
++        actor_class: type[SACActorModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
++        critic_class: type[SACCriticModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
++
++        # Resolve observation groups
++        default_sets = ["actor", "critic"]
++        if "rnd_cfg" in cfg["algorithm"] and cfg["algorithm"]["rnd_cfg"] is not None:
++            default_sets.append("rnd_state")
++        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], default_sets)
++
++        # Resolve RND config if used
++        cfg["algorithm"] = resolve_rnd_config(cfg["algorithm"], obs, cfg["obs_groups"], env)
++
++        # Resolve symmetry config if used
++        cfg["algorithm"] = resolve_symmetry_config(cfg["algorithm"], env)
++
++        # Initialize the actor
++        actor: SACActorModel = actor_class(
++            obs, cfg["obs_groups"], "actor", env.num_actions, **cfg["actor"]
++        ).to(device)
++        print(f"SAC Actor: {actor}")
++
++        # Compute action scaling from robot joint limits
++        upper, lower = SAC._compute_action_scaling(env, device)
++        lower_neg = -lower
++        actor.action_bias.copy_(0.5 * (upper + lower_neg))
++        actor.action_range.copy_(0.5 * (upper - lower_neg))
++        actor.log_action_range.copy_(torch.log(actor.action_range).sum())
++
++        # Initialize the critic
++        critic: SACCriticModel = critic_class(
++            obs, cfg["obs_groups"], "critic", 1, num_actions=env.num_actions, **cfg["critic"]
++        ).to(device)
++        print(f"SAC Critic: {critic}")
++
++        # Initialize the replay buffer
++        replay_buffer = ReplayBuffer(
++            env.num_envs,
++            cfg["num_steps_per_env"],
++            obs,
++            [env.num_actions],
++            device,
++            buffer_size=cfg["algorithm"].get("replay_buffer_size", 1_000_000),
++            n_steps=cfg["algorithm"].get("n_steps", 1),
++            gamma=cfg["algorithm"].get("gamma", 0.998),
++        )
++
++        # Initialize the algorithm
++        alg: SAC = alg_class(
++            actor, critic, replay_buffer, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg.get("multi_gpu")
++        )
++
++        return alg
++
++    @staticmethod
++    def _compute_action_scaling(env: VecEnv, device: str) -> tuple[torch.Tensor, torch.Tensor]:
++        """Compute per-joint action scaling factors based on robot configuration.
++
++        Returns:
++            Tuple of (upper_scaling, lower_scaling) tensors of shape (num_actions,).
++        """
++        unwrapped_env = getattr(env, "unwrapped", env)
++
++        if not hasattr(unwrapped_env, "scene") or "robot" not in unwrapped_env.scene.keys():
++            raise ValueError(
++                "SAC: Could not find 'robot' in env.scene. Please check the environment configuration."
++            )
++
++        robot = unwrapped_env.scene["robot"]
++
++        lower_limits = robot.data.soft_joint_pos_limits[0, :, 0].to(device)
++        upper_limits = robot.data.soft_joint_pos_limits[0, :, 1].to(device)
++        default_pos = robot.data.default_joint_pos[0].to(device)
++
++        if torch.isnan(lower_limits).any() or torch.isinf(lower_limits).any():
++            raise ValueError("SAC: Found NaN or Inf in lower joint position limits.")
++        if torch.isnan(upper_limits).any() or torch.isinf(upper_limits).any():
++            raise ValueError("SAC: Found NaN or Inf in upper joint position limits.")
++
++        # Get global action scale from the action manager
++        action_scale = 1.0
++        if hasattr(unwrapped_env, "action_manager"):
++            for term in unwrapped_env.action_manager._terms.values():
++                if hasattr(term.cfg, "scale"):
++                    if isinstance(term.cfg.scale, (float, int)):
++                        action_scale = term.cfg.scale
++                        break
++                    else:
++                        raise NotImplementedError(
++                            "SAC: Action scale is not a scalar. "
++                            "Please implement handling for dict/list scales if needed."
++                        )
++
++        range_to_lower = torch.abs(lower_limits - default_pos)
++        range_to_upper = torch.abs(upper_limits - default_pos)
++
++        scaling_factors_upper = range_to_upper / action_scale
++        scaling_factors_lower = range_to_lower / action_scale
++
++        print("SAC: Computed physics-based action scaling factors.")
++        print(f"  Global action scale from ActionManager: {action_scale}")
++        print(f"  Scaling factors lower limits: {scaling_factors_lower}")
++        print(f"  Scaling factors upper limits: {scaling_factors_upper}")
++
++        return scaling_factors_upper, scaling_factors_lower
++
++    def broadcast_parameters(self) -> None:
++        """Broadcast model parameters to all GPUs."""
++        model_params = [self.actor.state_dict(), self.critic.state_dict()]
++        if self.rnd:
++            model_params.append(self.rnd.predictor.state_dict())
++        torch.distributed.broadcast_object_list(model_params, src=0)
++        self.actor.load_state_dict(model_params[0])
++        self.critic.load_state_dict(model_params[1])
++        if self.rnd:
++            self.rnd.predictor.load_state_dict(model_params[2])
++
++    def reduce_parameters(self, params_or_model) -> None:
++        """Collect gradients from the provided params/model and average them across all GPUs.
++
++        Accepts either an nn.Module or an iterable of parameters.
++        """
++        if isinstance(params_or_model, torch.nn.Module):
++            params = list(params_or_model.parameters())
++        else:
++            params = list(params_or_model)
++
++        grads = [param.grad.view(-1) for param in params if param.grad is not None]
++        if not grads:
++            return
++
++        all_grads = torch.cat(grads)
++        torch.distributed.all_reduce(all_grads, op=torch.distributed.ReduceOp.SUM)
++        all_grads /= self.gpu_world_size
++
++        offset = 0
++        for param in params:
++            if param.grad is not None:
++                numel = param.numel()
++                param.grad.data.copy_(all_grads[offset : offset + numel].view_as(param.grad.data))
++                offset += numel
+diff -ruN pa/rsl_rl/models/__init__.py pb/rsl_rl/models/__init__.py
+--- pa/rsl_rl/models/__init__.py	2026-10-19 22:49:31
++++ pb/rsl_rl/models/__init__.py	2026-10-19 22:49:31
+@@ -14,3 +14,6 @@
+     "MLPModel",
+     "RNNModel",
+ ]
++
++from .sac_mlp_model import SACActorModel, SACCriticModel
++__all__ = list(__all__) + ["SACActorModel", "SACCriticModel"]
+diff -ruN pa/rsl_rl/models/sac_base_model.py pb/rsl_rl/models/sac_base_model.py
+--- pa/rsl_rl/models/sac_base_model.py	1969-12-31 16:00:00
++++ pb/rsl_rl/models/sac_base_model.py	2026-10-19 22:49:31
+@@ -0,0 +1,273 @@
++# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++from __future__ import annotations
++
++import copy
++import torch
++import torch.nn as nn
++from tensordict import TensorDict
++from torch.distributions import Normal
++
++from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
++from rsl_rl.utils import unpad_trajectories
++
++
++class SACBaseModel(nn.Module):
++    """MLP-based neural model.
++
++    This model uses a simple multi-layer perceptron (MLP) to process 1D observation groups. Obsevations can be
++    normalized before being passed to the MLP. The output of the model can be either deterministic or
++    stochastic, in which case a Gaussian distribution is used to sample the outputs.
++    """
++
++    is_recurrent: bool = False
++
++    def __init__(
++        self,
++        obs: TensorDict,
++        obs_groups: dict[str, list[str]],
++        obs_set: str,
++        output_dim: int,
++        hidden_dims: tuple[int] | list[int] = [256, 256, 256],
++        activation: str = "elu",
++        obs_normalization: bool = False,
++        stochastic: bool = False,
++        init_noise_std: float = 1.0,
++        noise_std_type: str = "scalar",
++        state_dependent_std: bool = False,
++        layer_norm: bool = False,
++    ) -> None:
++        """Initialize the MLP-based model.
++
++        Args:
++            obs: Observation Dictionary.
++            obs_groups: Dictionary mapping observation sets to lists of observation groups.
++            obs_set: Observation set to use for this model (e.g., "actor" or "critic").
++            output_dim: Dimension of the output.
++            hidden_dims: Hidden dimensions of the MLP.
++            activation: Activation function of the MLP.
++            obs_normalization: Whether to normalize the observations before feeding them to the MLP.
++            stochastic: Whether the model outputs stochastic or deterministic values.
++            init_noise_std: Initial standard deviation of the stochatic output.
++            noise_std_type: Whether the standard deviation is defined as a "scalar" or in "log" space.
++            state_dependent_std: Whether the standard deviation is state dependent.
++            layer_norm: Whether to apply layer normalization in MLP hidden layers.
++        """
++        super().__init__()
++
++        # Resolve observation groups and dimensions
++        self.obs_groups, self.obs_dim = self._get_obs_dim(obs, obs_groups, obs_set)
++
++        # Observation normalization
++        self.obs_normalization = obs_normalization
++        if obs_normalization:
++            self.obs_normalizer = EmpiricalNormalization(self.obs_dim)
++        else:
++            self.obs_normalizer = torch.nn.Identity()
++
++        # MLP
++        self.state_dependent_std = state_dependent_std
++        if state_dependent_std and stochastic:
++            self.mlp = MLP(self._get_latent_dim(), [2, output_dim], hidden_dims, activation, layer_norm=layer_norm)
++        else:
++            self.mlp = MLP(self._get_latent_dim(), output_dim, hidden_dims, activation, layer_norm=layer_norm)
++
++        # Stochasticity
++        self.stochastic = stochastic
++        self.noise_std_type = noise_std_type
++        if state_dependent_std and stochastic:
++            # Initialize weights and biases for the last layer of the std head
++            torch.nn.init.zeros_(self.mlp[-2].weight[output_dim:])  # type: ignore
++            if self.noise_std_type == "scalar":
++                torch.nn.init.constant_(self.mlp[-2].bias[output_dim:], init_noise_std)  # type: ignore
++            elif self.noise_std_type == "log":
++                init_noise_std_log = torch.log(torch.tensor(init_noise_std + 1e-7))
++                torch.nn.init.constant_(self.mlp[-2].bias[output_dim:], init_noise_std_log)  # type: ignore
++            else:
++                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
++        elif stochastic:
++            # Initialize parameters for state independent std
++            if self.noise_std_type == "scalar":
++                self.std = nn.Parameter(init_noise_std * torch.ones(output_dim))
++            elif self.noise_std_type == "log":
++                self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(output_dim)))
++            else:
++                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
++        # Note: Populated in update_distribution
++        self.distribution = None
++        # Disable args validation for speedup
++        Normal.set_default_validate_args(False)
++
++    def forward(
++        self,
++        obs: TensorDict,
++        masks: torch.Tensor | None = None,
++        hidden_state: HiddenState = None,
++        stochastic_output: bool = False,
++        actions: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Forward pass of the MLP model.
++
++        ..note::
++            The `stochastic_output` flag only has an effect if the model is initialized as stochastic and defaults to
++            `False`, meaning that even stochastic models will return deterministic outputs by default.
++
++        ..note::
++            The `actions` parameter is unused in the base class. It is provided so that subclasses (e.g.,
++            ``SACCriticModel``) can override ``forward()`` to accept actions without changing the call signature.
++        """
++        # If observations are padded for recurrent training but the model is non-recurrent, unpad the observations
++        obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
++        # Get MLP input latent
++        latent = self.get_latent(obs, masks, hidden_state)
++        # MLP forward pass
++        if self.stochastic and stochastic_output:
++            self._update_distribution(latent)
++            return self.distribution.sample()
++        else:
++            if self.state_dependent_std:
++                return self.mlp(latent)[..., 0, :]
++            else:
++                return self.mlp(latent)
++
++    def get_latent(
++        self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
++    ) -> torch.Tensor:
++        # Select and concatenate observations
++        obs_list = [obs[obs_group] for obs_group in self.obs_groups]
++        latent = torch.cat(obs_list, dim=-1)
++        # Normalize observations
++        latent = self.obs_normalizer(latent)
++        return latent
++
++    def get_hidden_state(self) -> HiddenState:
++        return None
++
++    def reset(self, dones: torch.Tensor | None = None, hidden_state: HiddenState = None) -> None:
++        pass
++
++    def detach_hidden_state(self, dones: torch.Tensor | None = None) -> None:
++        pass
++
++    @property
++    def output_mean(self) -> torch.Tensor:
++        return self.distribution.mean
++
++    @property
++    def output_std(self) -> torch.Tensor:
++        return self.distribution.stddev
++
++    @property
++    def output_entropy(self) -> torch.Tensor:
++        return self.distribution.entropy().sum(dim=-1)
++
++    def get_output_log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
++        return self.distribution.log_prob(outputs).sum(dim=-1)
++
++    def as_jit(self) -> nn.Module:
++        """Return a version of the model compatible with Torch JIT export."""
++        return _TorchMLPModel(self)
++
++    def as_onnx(self, verbose: bool) -> nn.Module:
++        """Return a version of the model compatible with ONNX export."""
++        return _OnnxMLPModel(self, verbose)
++
++    def update_normalization(self, obs: TensorDict) -> None:
++        if self.obs_normalization:
++            # Select and concatenate observations
++            obs_list = [obs[obs_group] for obs_group in self.obs_groups]
++            mlp_obs = torch.cat(obs_list, dim=-1)
++            # Update the normalizer parameters
++            self.obs_normalizer.update(mlp_obs)  # type: ignore
++
++    def _update_distribution(self, obs: torch.Tensor) -> None:
++        if self.state_dependent_std:
++            # Compute mean and standard deviation
++            mean_and_std = self.mlp(obs)
++            if self.noise_std_type == "scalar":
++                mean, std = torch.unbind(mean_and_std, dim=-2)
++            elif self.noise_std_type == "log":
++                mean, log_std = torch.unbind(mean_and_std, dim=-2)
++                std = torch.exp(log_std)
++            else:
++                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
++        else:
++            # Compute mean
++            mean = self.mlp(obs)
++            # Compute standard deviation
++            if self.noise_std_type == "scalar":
++                std = self.std.expand_as(mean)
++            elif self.noise_std_type == "log":
++                std = torch.exp(self.log_std).expand_as(mean)
++            else:
++                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
++        # Create distribution
++        self.distribution = Normal(mean, std)
++
++    def _get_obs_dim(self, obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
++        """Select active observation groups and compute observation dimension."""
++        active_obs_groups = obs_groups[obs_set]
++        obs_dim = 0
++        for obs_group in active_obs_groups:
++            assert len(obs[obs_group].shape) == 2, "The MLP model only supports 1D observations."
++            obs_dim += obs[obs_group].shape[-1]
++        return active_obs_groups, obs_dim
++
++    def _get_latent_dim(self) -> int:
++        return self.obs_dim
++
++
++class _TorchMLPModel(nn.Module):
++    """Exportable MLP model for JIT."""
++
++    def __init__(self, model: SACBaseModel) -> None:
++        super().__init__()
++        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
++        self.mlp = copy.deepcopy(model.mlp)
++        self.state_dependent_std = model.state_dependent_std
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.obs_normalizer(x)
++        out = self.mlp(x)
++        if self.state_dependent_std:
++            return out[..., 0, :]
++        return out
++
++    @torch.jit.export
++    def reset(self) -> None:
++        pass
++
++
++class _OnnxMLPModel(nn.Module):
++    """Exportable MLP model for ONNX."""
++
++    is_recurrent: bool = False
++
++    def __init__(self, model: SACBaseModel, verbose: bool) -> None:
++        super().__init__()
++        self.verbose = verbose
++        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
++        self.mlp = copy.deepcopy(model.mlp)
++        self.state_dependent_std = model.state_dependent_std
++        self.input_size = model.obs_dim
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.obs_normalizer(x)
++        out = self.mlp(x)
++        if self.state_dependent_std:
++            return out[..., 0, :]
++        return out
++
++    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
++        return (torch.zeros(1, self.input_size),)
++
++    @property
++    def input_names(self) -> list[str]:
++        return ["obs"]
++
++    @property
++    def output_names(self) -> list[str]:
++        return ["actions"]
+diff -ruN pa/rsl_rl/models/sac_mlp_model.py pb/rsl_rl/models/sac_mlp_model.py
+--- pa/rsl_rl/models/sac_mlp_model.py	1969-12-31 16:00:00
++++ pb/rsl_rl/models/sac_mlp_model.py	2026-10-19 22:49:31
+@@ -0,0 +1,377 @@
++# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++from __future__ import annotations
++
++import copy
++
++import torch
++import torch.nn as nn
++from tensordict import TensorDict
++from torch.distributions import Normal
++
++from rsl_rl.modules import MLP, EmpiricalNormalization, HiddenState
++from rsl_rl.utils import unpad_trajectories
++
++from .sac_base_model import SACBaseModel
++
++
++class SACActorModel(SACBaseModel):
++    """SAC actor model with Tanh-squashed Gaussian output distribution.
++
++    Inherits observation-group resolution, empirical normalization, and ``get_latent()`` from :class:`SACBaseModel`.
++    Overrides the forward pass to always produce Tanh-squashed, scaled actions and provides
++    ``sample_action_logp()`` for training with the corrected log-probability.
++
++    .. note::
++        TODO (future): Add support for recurrent SAC models (e.g., ``SACActorRNNModel(RNNModel)``)
++        analogous to how PPO has both ``SACBaseModel`` and ``RNNModel``. This would require adding
++        ``masks``/``hidden_state`` handling and extending the replay buffer to store hidden states.
++    """
++
++    def __init__(
++        self,
++        obs: TensorDict,
++        obs_groups: dict[str, list[str]],
++        obs_set: str,
++        output_dim: int,
++        hidden_dims: tuple[int] | list[int] = [256, 256, 256],
++        activation: str = "elu",
++        obs_normalization: bool = False,
++        init_noise_std: float = 1.0,
++        layer_norm: bool = False,
++        log_std_min: float = -20.0,
++        log_std_max: float = 2.0,
++        **kwargs,
++    ) -> None:
++        """Initialize the SAC actor model.
++
++        Args:
++            obs: Observation Dictionary.
++            obs_groups: Dictionary mapping observation sets to lists of observation groups.
++            obs_set: Observation set to use for this model (e.g., "actor").
++            output_dim: Dimension of the action space.
++            hidden_dims: Hidden dimensions of the MLP.
++            activation: Activation function of the MLP.
++            obs_normalization: Whether to normalize observations.
++            init_noise_std: Initial standard deviation for the log-std output head.
++            layer_norm: Whether to apply layer normalization in MLP hidden layers.
++            log_std_min: Minimum value for log standard deviation clamping.
++            log_std_max: Maximum value for log standard deviation clamping.
++        """
++        super().__init__(
++            obs,
++            obs_groups,
++            obs_set,
++            output_dim,
++            hidden_dims=hidden_dims,
++            activation=activation,
++            obs_normalization=obs_normalization,
++            stochastic=True,
++            noise_std_type="log",
++            state_dependent_std=True,
++            layer_norm=layer_norm,
++        )
++
++        self.output_dim = output_dim
++        self.log_std_min = log_std_min
++        self.log_std_max = log_std_max
++
++        # Custom actor weight initialization so that initial actions are near zero.
++        # This overrides the parent's default init for state_dependent_std and is critical
++        # for SAC stability — it prevents the initial policy from saturating the Tanh.
++        last_linear = None
++        for module in reversed(self.mlp):
++            if isinstance(module, nn.Linear):
++                last_linear = module
++                break
++        if last_linear is not None:
++            # Mean output head → near-zero initial actions
++            torch.nn.init.normal_(last_linear.weight[:output_dim], mean=0.0, std=1e-3)
++            torch.nn.init.zeros_(last_linear.bias[:output_dim])
++            # Log-std output head → log(init_noise_std)
++            torch.nn.init.zeros_(last_linear.weight[output_dim:])
++            torch.nn.init.constant_(last_linear.bias[output_dim:], torch.log(torch.tensor(init_noise_std + 1e-7)))
++
++        # Precomputed action scaling buffers — populated by SAC.construct_algorithm()
++        # after construction via .copy_(). Using register_buffer ensures .to(device) moves them.
++        self.register_buffer("action_bias", torch.zeros(output_dim))
++        self.register_buffer("action_range", torch.ones(output_dim))
++        self.register_buffer("log_action_range", torch.zeros(1))
++
++    def forward(
++        self,
++        obs: TensorDict,
++        masks: torch.Tensor | None = None,
++        hidden_state: HiddenState = None,
++        stochastic_output: bool = False,
++        actions: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Forward pass returning Tanh-squashed, scaled actions.
++
++        Args:
++            obs: Observation dictionary.
++            masks: Optional masks for unpadding trajectories (unused for non-recurrent).
++            hidden_state: Optional hidden state (unused for non-recurrent).
++            stochastic_output: If True, sample from the distribution; otherwise use the mean.
++            actions: Unused. Accepted for interface compatibility with SACBaseModel.
++
++        Returns:
++            Scaled actions after Tanh squashing.
++        """
++        obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
++        latent = self.get_latent(obs, masks, hidden_state)
++        self._update_distribution(latent)
++        if stochastic_output:
++            x_t = self.distribution.rsample()
++        else:
++            x_t = self.distribution.mean
++        return self._squash_and_scale(x_t)
++
++    def sample_action_logp(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor]:
++        """Sample an action and compute its corrected log-probability.
++
++        The log-probability includes corrections for Tanh squashing and action scaling.
++
++        Args:
++            obs: Observation dictionary.
++
++        Returns:
++            Tuple of (scaled_action, log_prob).
++        """
++        latent = self.get_latent(obs)
++        self._update_distribution(latent)
++        x_t = self.distribution.rsample()
++        tanh_x = torch.tanh(x_t)
++        action = self.action_range * tanh_x + self.action_bias
++
++        # Log-probability with Tanh Jacobian correction and action scale correction
++        log_prob = self.distribution.log_prob(x_t).sum(dim=-1, keepdim=True)
++        log_prob -= torch.log(1 - tanh_x.pow(2) + 1e-6).sum(dim=-1, keepdim=True)
++        log_prob -= self.log_action_range
++
++        return action, log_prob
++
++    def _update_distribution(self, latent: torch.Tensor) -> None:
++        """Update the Gaussian distribution with log-std clamping."""
++        mean_and_log_std = self.mlp(latent)
++        mean, log_std = torch.unbind(mean_and_log_std, dim=-2)
++        std = log_std.clamp(self.log_std_min, self.log_std_max).exp()
++        self.distribution = Normal(mean, std)
++
++    def _squash_and_scale(self, x_t: torch.Tensor) -> torch.Tensor:
++        """Apply Tanh squashing and affine action scaling using precomputed buffers."""
++        return self.action_range * torch.tanh(x_t) + self.action_bias
++
++    def as_jit(self) -> nn.Module:
++        """Return a version of the model compatible with Torch JIT export."""
++        return _TorchSACActorModel(self)
++
++    def as_onnx(self, verbose: bool = False) -> nn.Module:
++        """Return a version of the model compatible with ONNX export."""
++        return _OnnxSACActorModel(self, verbose)
++
++
++class SACCriticModel(SACBaseModel):
++    """SAC critic model with twin Q-networks and frozen target networks.
++
++    Inherits observation-group resolution, empirical normalization, and ``update_normalization()``
++    from :class:`SACBaseModel`. Overrides the MLP with twin Q-networks that take concatenated
++    (observation, action) inputs.
++
++    Target networks are frozen copies (``requires_grad=False``) of the online Q-networks.
++    They are never updated by gradient descent — only by Polyak averaging via
++    ``soft_update_target_networks(tau)``.
++    """
++
++    def __init__(
++        self,
++        obs: TensorDict,
++        obs_groups: dict[str, list[str]],
++        obs_set: str,
++        output_dim: int,
++        hidden_dims: tuple[int] | list[int] = [256, 256, 256],
++        activation: str = "elu",
++        obs_normalization: bool = False,
++        num_actions: int = 0,
++        layer_norm: bool = False,
++        **kwargs,
++    ) -> None:
++        """Initialize the SAC critic model.
++
++        Args:
++            obs: Observation Dictionary.
++            obs_groups: Dictionary mapping observation sets to lists of observation groups.
++            obs_set: Observation set to use for this model (e.g., "critic").
++            output_dim: Dimension of the Q-value output (typically 1).
++            hidden_dims: Hidden dimensions of the Q-network MLPs.
++            activation: Activation function of the MLPs.
++            obs_normalization: Whether to normalize observations.
++            num_actions: Dimension of the action space (concatenated with observations).
++            layer_norm: Whether to apply layer normalization in MLP hidden layers.
++        """
++        super().__init__(
++            obs,
++            obs_groups,
++            obs_set,
++            output_dim,
++            hidden_dims=hidden_dims,
++            activation=activation,
++            obs_normalization=obs_normalization,
++            stochastic=False,
++            layer_norm=layer_norm,
++        )
++
++        self.num_actions = num_actions
++
++        # Override parent's MLP — critic input is obs_dim + num_actions
++        q_input_dim = self.obs_dim + num_actions
++        self.mlp = None  # type: ignore[assignment]
++
++        # Twin Q-networks
++        self.critic1 = MLP(q_input_dim, output_dim, hidden_dims, activation, layer_norm=layer_norm)
++        self.critic2 = MLP(q_input_dim, output_dim, hidden_dims, activation, layer_norm=layer_norm)
++
++        # Frozen target networks — never updated by gradient descent
++        self.critic1_target = copy.deepcopy(self.critic1)
++        self.critic2_target = copy.deepcopy(self.critic2)
++        for param in self.critic1_target.parameters():
++            param.requires_grad = False
++        for param in self.critic2_target.parameters():
++            param.requires_grad = False
++
++    def forward(
++        self,
++        obs: TensorDict,
++        masks: torch.Tensor | None = None,
++        hidden_state: HiddenState = None,
++        stochastic_output: bool = False,
++        actions: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        """Forward pass returning Q1 value.
++
++        Args:
++            obs: Observation dictionary.
++            masks: Optional masks for unpadding trajectories.
++            hidden_state: Optional hidden state (unused for non-recurrent).
++            stochastic_output: Unused for the critic.
++            actions: Action tensor to concatenate with observations.
++
++        Returns:
++            Q1 value estimate.
++        """
++        obs = unpad_trajectories(obs, masks) if masks is not None and not self.is_recurrent else obs
++        latent = self.get_latent(obs, masks, hidden_state)
++        q_input = torch.cat([latent, actions], dim=-1)
++        return self.critic1(q_input)
++
++    def evaluate_all_q(self, obs: TensorDict, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Compute Q1 and Q2 for the given observations and actions.
++
++        Args:
++            obs: Observation dictionary.
++            actions: Action tensor.
++
++        Returns:
++            Tuple of (Q1, Q2) value estimates.
++        """
++        latent = self.get_latent(obs)
++        latent = torch.cat([latent, actions], dim=-1)
++        return self.critic1(latent), self.critic2(latent)
++
++    def evaluate_all_target_q(self, obs: TensorDict, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        """Compute target Q1 and target Q2 for the given observations and actions.
++
++        Uses the frozen target networks (never updated by gradient descent).
++
++        Args:
++            obs: Observation dictionary.
++            actions: Action tensor.
++
++        Returns:
++            Tuple of (Q1_target, Q2_target) value estimates.
++        """
++        latent = self.get_latent(obs)
++        latent = torch.cat([latent, actions], dim=-1)
++        return self.critic1_target(latent), self.critic2_target(latent)
++
++    def init_target_networks(self) -> None:
++        """Initialize the target networks with the current critic network parameters."""
++        self.critic1_target.load_state_dict(self.critic1.state_dict())
++        self.critic2_target.load_state_dict(self.critic2.state_dict())
++
++    def soft_update_target_networks(self, tau: float) -> None:
++        """Soft-update the target networks using Polyak averaging.
++
++        New target parameters are computed as: ``target = tau * online + (1 - tau) * target``.
++
++        Args:
++            tau: Interpolation parameter for soft updates.
++        """
++        for target_param, param in zip(self.critic1_target.parameters(), self.critic1.parameters()):
++            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
++        for target_param, param in zip(self.critic2_target.parameters(), self.critic2.parameters()):
++            target_param.data.copy_(tau * param.data + (1.0 - tau) * target_param.data)
++
++
++##############################################
++# Export helpers — JIT and ONNX for SAC Actor
++##############################################
++
++
++class _TorchSACActorModel(nn.Module):
++    """Exportable SAC actor model for JIT.
++
++    Includes obs normalization, MLP forward, Tanh squashing, and action scaling.
++    """
++
++    def __init__(self, model: SACActorModel) -> None:
++        super().__init__()
++        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
++        self.mlp = copy.deepcopy(model.mlp)
++        self.action_bias = model.action_bias.clone()
++        self.action_range = model.action_range.clone()
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.obs_normalizer(x)
++        mean_and_log_std = self.mlp(x)
++        mean = mean_and_log_std[..., 0, :]
++        return self.action_range * torch.tanh(mean) + self.action_bias
++
++    @torch.jit.export
++    def reset(self) -> None:
++        pass
++
++
++class _OnnxSACActorModel(nn.Module):
++    """Exportable SAC actor model for ONNX."""
++
++    is_recurrent: bool = False
++
++    def __init__(self, model: SACActorModel, verbose: bool) -> None:
++        super().__init__()
++        self.verbose = verbose
++        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
++        self.mlp = copy.deepcopy(model.mlp)
++        self.register_buffer("action_bias", model.action_bias.clone())
++        self.register_buffer("action_range", model.action_range.clone())
++        self.input_size = model.obs_dim
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        x = self.obs_normalizer(x)
++        mean_and_log_std = self.mlp(x)
++        mean = mean_and_log_std[..., 0, :]
++        return self.action_range * torch.tanh(mean) + self.action_bias
++
++    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
++        return (torch.zeros(1, self.input_size),)
++
++    @property
++    def input_names(self) -> list[str]:
++        return ["obs"]
++
++    @property
++    def output_names(self) -> list[str]:
++        return ["actions"]
+diff -ruN pa/rsl_rl/modules/mlp.py pb/rsl_rl/modules/mlp.py
+--- pa/rsl_rl/modules/mlp.py	2026-10-19 22:49:31
++++ pb/rsl_rl/modules/mlp.py	2026-10-19 22:49:31
+@@ -31,6 +31,7 @@
+         hidden_dims: tuple[int, ...] | list[int],
+         activation: str = "elu",
+         last_activation: str | None = None,
++        layer_norm: bool = False,
+     ) -> None:
+         """Initialize the MLP.
+ 
+@@ -41,6 +42,7 @@
+                 inferred from the input dimension.
+             activation: Activation function.
+             last_activation: Activation function of the last layer. None results in a linear last layer.
++            layer_norm: Whether to apply layer normalization after hidden linear layers.
+         """
+         super().__init__()
+ 
+@@ -54,10 +56,14 @@
+         layers = []
+         layers.append(nn.Linear(input_dim, hidden_dims_processed[0]))
+         layers.append(activation_mod)
++        if layer_norm:
++            layers.append(nn.LayerNorm(hidden_dims_processed[0]))
+ 
+         for layer_index in range(len(hidden_dims_processed) - 1):
+             layers.append(nn.Linear(hidden_dims_processed[layer_index], hidden_dims_processed[layer_index + 1]))
+             layers.append(activation_mod)
++            if layer_norm:
++                layers.append(nn.LayerNorm(hidden_dims_processed[layer_index + 1]))
+ 
+         # Add last layer
+         if isinstance(output_dim, int):
+diff -ruN pa/rsl_rl/runners/__init__.py pb/rsl_rl/runners/__init__.py
+--- pa/rsl_rl/runners/__init__.py	2026-10-19 22:49:31
++++ pb/rsl_rl/runners/__init__.py	2026-10-19 22:49:31
+@@ -9,3 +9,6 @@
+ from .distillation_runner import DistillationRunner
+ 
+ __all__ = ["DistillationRunner", "OnPolicyRunner"]
++
++from .off_policy_runner import OffPolicyRunner
++__all__ = list(__all__) + ["OffPolicyRunner"]
+diff -ruN pa/rsl_rl/runners/off_policy_runner.py pb/rsl_rl/runners/off_policy_runner.py
+--- pa/rsl_rl/runners/off_policy_runner.py	1969-12-31 16:00:00
++++ pb/rsl_rl/runners/off_policy_runner.py	2026-10-19 22:49:31
+@@ -0,0 +1,257 @@
++# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++from __future__ import annotations
++
++import os
++import time
++import torch
++
++from rsl_rl.algorithms import SAC
++from rsl_rl.env import VecEnv
++from rsl_rl.models import SACActorModel
++from rsl_rl.utils import resolve_callable
++from rsl_rl.utils.logger import Logger
++
++
++class OffPolicyRunner:
++    """Off-policy runner for training with SAC."""
++
++    alg: SAC
++    """The SAC algorithm."""
++
++    def __init__(self, env: VecEnv, train_cfg: dict, log_dir: str | None = None, device: str = "cpu") -> None:
++        self.cfg = train_cfg
++        self.device = device
++        self.env = env
++
++        # Setup multi-GPU training if enabled
++        self._configure_multi_gpu()
++
++        # Query observations from environment for algorithm construction
++        obs = self.env.get_observations()
++
++        # Create the algorithm (all construction logic lives in SAC.construct_algorithm)
++        alg_class: type[SAC] = resolve_callable(self.cfg["algorithm"]["class_name"])  # type: ignore
++        self.alg = alg_class.construct_algorithm(obs, self.env, self.cfg, self.device)
++
++        # Create the logger
++        self.logger = Logger(
++            log_dir=log_dir,
++            cfg=self.cfg,
++            env_cfg=self.env.cfg,
++            num_envs=self.env.num_envs,
++            is_distributed=self.is_distributed,
++            gpu_world_size=self.gpu_world_size,
++            gpu_global_rank=self.gpu_global_rank,
++            device=self.device,
++        )
++
++        # Track the current learning iteration
++        self.current_learning_iteration = 0
++        self.start_training = self.cfg.get("start_training", 0)
++        self.log_interval = self.cfg.get("log_interval", 20)
++
++    def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False) -> None:
++        """Run the training loop."""
++        # Randomize initial episode lengths (for exploration)
++        if init_at_random_ep_len:
++            self.env.episode_length_buf = torch.randint_like(
++                self.env.episode_length_buf, high=int(self.env.max_episode_length)
++            )
++
++        # Start learning
++        obs = self.env.get_observations().to(self.device)
++        self.alg.train_mode()
++
++        # Ensure all parameters are in-synced
++        if self.is_distributed:
++            print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
++            self.alg.broadcast_parameters()
++
++        # Initialize the logging writer
++        self.logger.init_logging_writer()
++
++        start_iter = self.current_learning_iteration
++        tot_iter = start_iter + num_learning_iterations
++
++        log_window_collect_time = 0.0
++        log_window_learn_time = 0.0
++        log_window_iters = 0
++
++        for it in range(start_iter, tot_iter):
++            start = time.time()
++            # Rollout
++            with torch.inference_mode():
++                for _ in range(self.cfg["num_steps_per_env"]):
++                    actions = self.alg.act(obs)
++                    next_obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
++                    next_obs, rewards, dones = next_obs.to(self.device), rewards.to(self.device), dones.to(self.device)
++                    self.alg.process_env_step(next_obs, rewards, dones, extras)
++                    # Extract intrinsic rewards (only for logging)
++                    intrinsic_rewards = (
++                        self.alg.intrinsic_rewards if self.alg.rnd else None
++                    )
++                    self.logger.process_env_step(rewards, dones, extras, intrinsic_rewards)
++                    obs = next_obs
++
++                stop = time.time()
++                collection_time = stop - start
++                start = stop
++
++            if it >= self.start_training:
++                loss_dict = self.alg.update()
++            else:
++                loss_dict = {}
++
++            stop = time.time()
++            learn_time = stop - start
++            self.current_learning_iteration = it
++
++            # Accumulate timing across iterations when logging sparsely
++            log_window_collect_time += collection_time
++            log_window_learn_time += learn_time
++            log_window_iters += 1
++
++            # Log information
++            should_log = (it % self.log_interval == 0) or (it == tot_iter - 1)
++            if should_log:
++                window_collection_size = (
++                    self.cfg["num_steps_per_env"] * self.env.num_envs * self.gpu_world_size * log_window_iters
++                )
++                self.logger.log(
++                    it=it,
++                    start_it=start_iter,
++                    total_it=tot_iter,
++                    collect_time=log_window_collect_time,
++                    learn_time=log_window_learn_time,
++                    loss_dict=loss_dict,
++                    learning_rate=self.alg.actor_learning_rate,
++                    action_std=self.alg.get_policy().output_std,
++                    rnd_weight=self.alg.rnd.weight if self.alg.rnd else None,
++                    alpha=getattr(self.alg, "alpha", None),
++                    collection_size_override=window_collection_size,
++                )
++                log_window_collect_time = 0.0
++                log_window_learn_time = 0.0
++                log_window_iters = 0
++
++            # Save model
++            if self.logger.writer is not None and it % self.cfg["save_interval"] == 0 and it != 0:
++                self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore
++
++        # Save the final model after training and stop the logging writer
++        if self.logger.writer is not None:
++            self.save(os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"))  # type: ignore
++            self.logger.stop_logging_writer()
++
++    def save(self, path: str, infos: dict | None = None) -> None:
++        """Save the models and training state to a given path."""
++        saved_dict = self.alg.save()
++        saved_dict["iter"] = self.current_learning_iteration
++        saved_dict["infos"] = infos
++        torch.save(saved_dict, path)
++        self.logger.save_model(path, self.current_learning_iteration)
++
++    def load(
++        self, path: str, load_cfg: dict | None = None, strict: bool = True, map_location: str | None = None
++    ) -> dict:
++        """Load the models and training state from a given path.
++
++        Args:
++            path: Path to load the model from.
++            load_cfg: Optional dictionary that defines what models and states to load. If None, all are loaded.
++            strict: Whether state_dict loading should be strict.
++            map_location: Device mapping for loading the model.
++        """
++        loaded_dict = torch.load(path, weights_only=False, map_location=map_location)
++        load_iteration = self.alg.load(loaded_dict, load_cfg, strict)
++        if load_iteration:
++            self.current_learning_iteration = loaded_dict["iter"]
++        return loaded_dict["infos"]
++
++    def get_inference_policy(self, device: str | None = None) -> SACActorModel:
++        """Return the policy on the requested device for inference."""
++        self.alg.eval_mode()
++        return self.alg.get_policy().to(device)  # type: ignore
++
++    def export_policy_to_jit(self, path: str, filename: str = "policy.pt") -> None:
++        """Export the model to a Torch JIT file."""
++        jit_model = self.alg.get_policy().as_jit()
++        jit_model.to("cpu")
++
++        if not os.path.exists(path):
++            os.makedirs(path, exist_ok=True)
++        save_path = os.path.join(path, filename)
++
++        traced_model = torch.jit.script(jit_model)
++        traced_model.save(save_path)
++
++    def export_policy_to_onnx(self, path: str, filename: str = "policy.onnx", verbose: bool = False) -> None:
++        """Export the model into an ONNX file."""
++        onnx_model = self.alg.get_policy().as_onnx(verbose=verbose)
++        onnx_model.to("cpu")
++        onnx_model.eval()
++
++        if not os.path.exists(path):
++            os.makedirs(path, exist_ok=True)
++        save_path = os.path.join(path, filename)
++
++        torch.onnx.export(
++            onnx_model,
++            onnx_model.get_dummy_inputs(),  # type: ignore
++            save_path,
++            export_params=True,
++            opset_version=18,
++            verbose=verbose,
++            input_names=onnx_model.input_names,  # type: ignore
++            output_names=onnx_model.output_names,  # type: ignore
++            dynamic_axes={},
++        )
++
++    def train_mode(self) -> None:
++        self.alg.train_mode()
++
++    def eval_mode(self) -> None:
++        self.alg.eval_mode()
++
++    def add_git_repo_to_log(self, repo_file_path: str) -> None:
++        self.logger.git_status_repos.append(repo_file_path)
++
++    def _configure_multi_gpu(self) -> None:
++        """Configure multi-gpu training."""
++        self.gpu_world_size = int(os.getenv("WORLD_SIZE", "1"))
++        self.is_distributed = self.gpu_world_size > 1
++
++        if not self.is_distributed:
++            self.gpu_local_rank = 0
++            self.gpu_global_rank = 0
++            self.cfg["multi_gpu"] = None
++            return
++
++        self.gpu_local_rank = int(os.getenv("LOCAL_RANK", "0"))
++        self.gpu_global_rank = int(os.getenv("RANK", "0"))
++
++        self.cfg["multi_gpu"] = {
++            "global_rank": self.gpu_global_rank,
++            "local_rank": self.gpu_local_rank,
++            "world_size": self.gpu_world_size,
++        }
++
++        if self.device != f"cuda:{self.gpu_local_rank}":
++            raise ValueError(
++                f"Device '{self.device}' does not match expected device for local rank '{self.gpu_local_rank}'."
++            )
++        if self.gpu_local_rank >= self.gpu_world_size:
++            raise ValueError(
++                f"Local rank '{self.gpu_local_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
++            )
++        if self.gpu_global_rank >= self.gpu_world_size:
++            raise ValueError(
++                f"Global rank '{self.gpu_global_rank}' is greater than or equal to world size '{self.gpu_world_size}'."
++            )
++
++        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
++        torch.cuda.set_device(self.gpu_local_rank)
+diff -ruN pa/rsl_rl/storage/__init__.py pb/rsl_rl/storage/__init__.py
+--- pa/rsl_rl/storage/__init__.py	2026-10-19 22:49:31
++++ pb/rsl_rl/storage/__init__.py	2026-10-19 22:49:31
+@@ -8,3 +8,6 @@
+ from .rollout_storage import RolloutStorage
+ 
+ __all__ = ["RolloutStorage"]
++
++from .replay_buffer import ReplayBuffer
++__all__ = list(__all__) + ["ReplayBuffer"]
+diff -ruN pa/rsl_rl/storage/replay_buffer.py pb/rsl_rl/storage/replay_buffer.py
+--- pa/rsl_rl/storage/replay_buffer.py	1969-12-31 16:00:00
++++ pb/rsl_rl/storage/replay_buffer.py	2026-10-19 22:49:31
+@@ -0,0 +1,290 @@
++import torch
++import warnings
++from tensordict import TensorDict
++
++class ReplayBuffer:
++    """Fixed-size buffer to store experience tuples."""
++
++    class Transition:
++        """Storage for a single state transition"""
++
++        def __init__(self) -> None:
++            self.observations: TensorDict | None = None
++            self.actions: torch.Tensor | None = None
++            self.rewards: torch.Tensor | None = None
++            self.next_observations: TensorDict | None = None
++            self.dones: torch.Tensor | None = None
++            self.bootstrap: torch.Tensor | None = None
++
++        def clear(self) -> None:
++            self.__init__()
++
++    def __init__(self, num_envs, num_transitions_per_env, obs, actions_shape, device, buffer_size, n_steps=1, gamma=0.99):
++        """
++        Initialize a ReplayBuffer object.
++        Args:
++            - dim (int or list of int): Dimension(s) of the data to be stored.
++                                    If a list, is stands for the dimensions of transition elements:
++                                    [obs_dim, action_dim, reward_dim, next_obs_dim, done_dim].
++            - buffer_size (int): Maximum size of buffer.
++            - device (torch.device): Device on which tensors are stored.
++            - n_steps (int): Number of steps for n-step returns (default: 1).
++            - gamma (float): Discount factor for n-step returns (default: 0.99).
++        """
++        self.buffer_size = buffer_size
++        self.device = device
++        self.n_steps = n_steps
++        self.gamma = gamma
++
++        self.replay_buf = None
++        self.num_envs = num_envs
++        self.step = 0
++        self.num_transitions_per_env = num_transitions_per_env
++        self.num_transitions = 0
++        #adjust buffer size based on number of envs
++        self.buffer_size = max(buffer_size // num_envs, 1)
++
++        #store shapes to build the buffer later
++        # shape of observation for each group
++        self.values_shape = {key: value.shape[1:] for key, value in obs.items()}
++        #shape of actions
++        self.actions_shape = tuple(actions_shape)
++
++        # list-based storage spec: [obs, action, reward, next_obs, done]
++        # dims <= 0 become None buffers (we keep all > 0 here)
++        self.obs = None
++        self.actions = None
++        self.rewards = None
++        self.next_obs = None
++        self.dones = None
++        self.bootstrap = None
++
++        self.observations = TensorDict(
++            {key: torch.zeros(num_envs, self.buffer_size, *value.shape[1:], device=self.device) for key, value in obs.items()},
++            batch_size=[num_envs, self.buffer_size],
++            device=self.device,
++        )
++        self.actions = torch.zeros(num_envs, self.buffer_size, *actions_shape, device=self.device)
++        self.rewards = torch.zeros(num_envs, self.buffer_size, 1, device=self.device)
++        self.next_observations = TensorDict(
++            {key: torch.zeros(num_envs, self.buffer_size, *value.shape[1:], device=self.device) for key, value in obs.items()},
++            batch_size=[num_envs, self.buffer_size],
++            device=self.device,
++        )
++        self.dones = torch.zeros(num_envs, self.buffer_size, 1, device=self.device)
++        self.bootstrap = torch.zeros(num_envs, self.buffer_size, 1, device=self.device)
++
++        self.replay_buf = [self.observations, self.actions, self.rewards, self.next_observations, self.dones, self.bootstrap]
++
++    def clear (self) -> None:
++        """Clear the replay buffer."""
++        self.step = 0
++        self.num_transitions = 0
++
++    def add_transition(self, transition: Transition) -> None:
++        """Add a single transition using a RolloutStorage-style API."""
++        if transition is None:
++            raise ValueError("Transition is None.")
++        if transition.observations is None or transition.actions is None:
++            raise ValueError("Transition observations/actions must be provided.")
++        if transition.rewards is None or transition.next_observations is None:
++            raise ValueError("Transition rewards/next_observations must be provided.")
++        if transition.dones is None or transition.bootstrap is None:
++            raise ValueError("Transition dones/bootstrap must be provided.")
++
++        self._insert(
++            (
++                transition.observations,
++                transition.actions,
++                transition.rewards,
++                transition.next_observations,
++                transition.dones,
++                transition.bootstrap,
++            )
++        )
++
++    def _insert(self, input_buf):
++        """Add new states to memory in a circular manner.
++
++        input_buf: list/tuple with entries matching self.replay_buf layout:
++            [observations(TensorDict), actions(tensor), rewards(tensor), next_observations(TensorDict), dones(tensor), bootstrap(tensor)]
++        Each entry should have shape [num_envs, num_inputs, ...] where num_inputs is how many time steps
++        (usually 1) are being inserted per env.
++        """
++
++        def _insert_into_buffer(r_buf, i_buf):
++            '''Helper function to insert i_buf into r_buf circularly.'''
++            num_inputs = i_buf.shape[1]
++            end_idx = self.step + num_inputs
++            if end_idx > self.buffer_size:
++                r_buf[:, self.step:self.buffer_size] = i_buf[:, :self.buffer_size - self.step]
++                r_buf[:, :end_idx - self.buffer_size] = i_buf[:, self.buffer_size - self.step:]
++            else:
++                r_buf[:, self.step:end_idx] = i_buf
++            return num_inputs
++
++
++        num_inputs = 0
++        if isinstance(self.replay_buf, list):
++            # iterate over each buffer entry and insert accordingly
++            for r_buf, i_buf in zip(self.replay_buf, input_buf):
++                if r_buf is not None and i_buf is not None:
++                    if isinstance(r_buf, TensorDict):
++                        if not isinstance(i_buf, TensorDict):
++                            raise ValueError("Input buffer must be a TensorDict if replay buffer is a TensorDict.")
++                        # Sanity check for matching keys
++                        if list(r_buf.keys()) != list(i_buf.keys()):
++                            raise ValueError(f"Input buffer TensorDict keys do not \
++                                             match replay buffer TensorDict keys: {list(i_buf.keys())} != {list(r_buf.keys())}")
++                        # TensorDict case
++                        for key in r_buf.keys():
++                            r_field = r_buf[key]
++                            i_field = i_buf[key]
++                            # unsqueeze if needed
++                            i_field = i_field.unsqueeze(1) if r_field.ndim > i_field.ndim else i_field
++                            ni = _insert_into_buffer(r_field, i_field)
++                            if num_inputs == 0:
++                                num_inputs = ni
++                            else:
++                                assert num_inputs == ni, f"Mismatch in number of \
++                                    inputs inserted across TensorDict fields: {num_inputs} != {ni} for key {key}."
++                    else:
++                        # Regular tensor case
++                        # if scalar, first unsqueeze -1 and then unsqueeze 1 if needed
++                        if r_buf.ndim > i_buf.ndim:
++                            if i_buf.ndim == 1:
++                                i_buf = i_buf.unsqueeze(-1)
++                            i_buf = i_buf.unsqueeze(1)
++                        ni = _insert_into_buffer(r_buf, i_buf)
++                        if num_inputs == 0:
++                            num_inputs = ni
++                        else:
++                            assert num_inputs == ni, f"Mismatch in number of \
++                                    inputs inserted across TensorDict fields: {num_inputs} != {ni} for key {key}."
++                else:
++                    raise ValueError(f"Either replay buffer or input buffer contains None entries: r_buf={r_buf}, i_buf={i_buf}")
++        else:
++            raise NotImplementedError("ReplayBuffer currently only supports list-based storage.")
++
++        # update counters for circular buffer
++        self.num_transitions = min(self.buffer_size, self.num_transitions + num_inputs)
++        self.step = (self.step + num_inputs) % self.buffer_size
++
++    def mini_batch_generator(self, num_mini_batch, mini_batch_size, num_epochs=1):
++        """Yield transition mini-batches (no sequence axis)."""
++        assert self.replay_buf is not None, "Replay buffer is not initialized."
++        valid_indices = self._generate_valid_indices()
++
++        for _ in range(num_epochs):
++            for _ in range(num_mini_batch):
++                yield self._generate_batch(valid_indices, mini_batch_size)
++
++    def _generate_valid_indices(self):
++        """Generate valid (env, start) transition indices."""
++        if self.num_transitions == 0:
++            return None
++
++        time_len = self.num_transitions if self.num_transitions < self.buffer_size else self.buffer_size
++        env_ids = torch.arange(self.num_envs, device=self.device)
++        time_ids = torch.arange(time_len, device=self.device)
++        env_grid, time_grid = torch.meshgrid(env_ids, time_ids, indexing="ij")
++        env_indices = env_grid.reshape(-1)
++        start_indices = time_grid.reshape(-1)
++
++        if self.n_steps > 1:
++            max_offset = self.n_steps - 1
++            if self.num_transitions == self.buffer_size:
++                if max_offset >= self.buffer_size:
++                    raise ValueError("n_steps must be <= buffer_size to avoid wrap across time.")
++                starts_before_step = start_indices < self.step
++                safe_before = (start_indices + max_offset) < self.step
++                safe_after = (start_indices + max_offset) < (self.buffer_size + self.step)
++                safe_mask = torch.where(starts_before_step, safe_before, safe_after)
++            else:
++                safe_mask = (start_indices + max_offset) < self.num_transitions
++            env_indices = env_indices[safe_mask]
++            start_indices = start_indices[safe_mask]
++
++        return env_indices, start_indices
++
++    def _generate_batch(self, valid_indices, mini_batch_size):
++        """Sample a transition mini-batch with optional n-step target aggregation."""
++        if valid_indices is None:
++            raise ValueError("No valid indices available to sample from.")
++
++        env_indices, start_indices = valid_indices
++        total_transitions = len(env_indices)
++        if total_transitions == 0:
++            raise ValueError("Replay buffer does not contain enough data to sample a batch.")
++
++        max_batch_size = total_transitions
++        if max_batch_size < mini_batch_size:
++            warnings.warn(
++                f"Requested mini_batch_size={mini_batch_size} exceeds available transitions ({total_transitions}). "
++                f"Using batch size {max_batch_size} instead.",
++                RuntimeWarning,
++            )
++        batch_size = max(1, min(mini_batch_size, max_batch_size))
++
++        sampled_idxs = torch.randint(total_transitions, size=(batch_size,), device=self.device)
++        sampled_envs = env_indices[sampled_idxs]
++        sampled_starts = start_indices[sampled_idxs]
++
++        obs_buf, actions_buf, rewards_buf, next_obs_buf, dones_buf, bootstrap_buf = self.replay_buf
++
++        if self.n_steps == 1:
++            obs_out = TensorDict({k: v[sampled_envs, sampled_starts] for k, v in obs_buf.items()}, batch_size=[batch_size], device=self.device)
++            actions_out = actions_buf[sampled_envs, sampled_starts]
++            rewards_out = rewards_buf[sampled_envs, sampled_starts]
++            next_obs_out = TensorDict({k: v[sampled_envs, sampled_starts] for k, v in next_obs_buf.items()}, batch_size=[batch_size], device=self.device)
++            dones_out = dones_buf[sampled_envs, sampled_starts]
++            bootstrap_out = bootstrap_buf[sampled_envs, sampled_starts]
++            effective_n_steps = torch.ones(batch_size, 1, device=self.device, dtype=torch.long)
++            return [
++                obs_out,
++                actions_out,
++                rewards_out,
++                next_obs_out,
++                dones_out,
++                bootstrap_out,
++                effective_n_steps,
++            ]
++
++        #Create n-step indices
++        step_offsets = torch.arange(self.n_steps, device=self.device)
++        all_indices = (sampled_starts.unsqueeze(-1) + step_offsets) % self.buffer_size
++        env_indices_expanded = sampled_envs.unsqueeze(-1).expand(batch_size, self.n_steps)
++
++        all_rewards = rewards_buf[env_indices_expanded, all_indices].squeeze(-1)
++        all_dones = dones_buf[env_indices_expanded, all_indices].squeeze(-1)
++
++        # Zero out rewards after done and compute discounted sum with done masks
++        all_dones_shifted = torch.cat([torch.zeros_like(all_dones[..., :1]), all_dones[..., :-1]], dim=-1)
++        # Cumulative product to create masks that zero out rewards after the first done is encountered
++        done_masks = torch.cumprod(1.0 - all_dones_shifted, dim=-1)
++        # Discount factors: gamma^0, gamma^1, ..., gamma^(n-1)
++        discounts = torch.pow(self.gamma, step_offsets)
++        n_step_rewards = (all_rewards * done_masks * discounts.view(1, -1)).sum(dim=-1, keepdim=True)
++
++        # Find the first done index for each transition to determine the correct next_obs, done, and bootstrap values
++        first_done = torch.argmax((all_dones > 0).float(), dim=-1)
++        no_dones = (all_dones.sum(dim=-1) == 0)
++        first_done = torch.where(no_dones, torch.full_like(first_done, self.n_steps - 1), first_done)
++        effective_n_steps = (first_done + 1).unsqueeze(-1).to(torch.long)
++        final_step_indices = all_indices.gather(1, first_done.unsqueeze(-1)).squeeze(-1)
++
++        obs_out = TensorDict({k: v[sampled_envs, sampled_starts] for k, v in obs_buf.items()}, batch_size=[batch_size], device=self.device)
++        actions_out = actions_buf[sampled_envs, sampled_starts]
++        next_obs_out = TensorDict({k: v[sampled_envs, final_step_indices] for k, v in next_obs_buf.items()}, batch_size=[batch_size], device=self.device)
++        final_dones = dones_buf[sampled_envs, final_step_indices]
++        final_bootstraps = bootstrap_buf[sampled_envs, final_step_indices]
++
++        return [
++            obs_out,
++            actions_out,
++            n_step_rewards,
++            next_obs_out,
++            final_dones,
++            final_bootstraps,
++            effective_n_steps,
++        ]
+diff -ruN pa/rsl_rl/utils/logger.py pb/rsl_rl/utils/logger.py
+--- pa/rsl_rl/utils/logger.py	2026-10-19 22:49:31
++++ pb/rsl_rl/utils/logger.py	2026-10-19 22:49:31
+@@ -164,6 +164,8 @@
+         learning_rate: float,
+         action_std: torch.Tensor,
+         rnd_weight: float | None,
++        alpha: float | None = None,
++        collection_size_override: int | None = None,
+         print_minimal: bool = False,
+         width: int = 80,
+         pad: int = 40,
+@@ -173,7 +175,11 @@
+         If videos are available, they are uploaded to the logging service (W&B) as well.
+         """
+         if self.writer is not None:
+-            collection_size = self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
++            collection_size = (
++                collection_size_override
++                if collection_size_override is not None
++                else self.cfg["num_steps_per_env"] * self.num_envs * self.gpu_world_size
++            )
+             iteration_time = collect_time + learn_time
+             self.tot_timesteps += collection_size
+             self.tot_time += iteration_time
+@@ -209,6 +215,8 @@
+ 
+             # Log std
+             self.writer.add_scalar("Policy/mean_std", action_std.mean().item(), it)
++            if alpha is not None:
++                self.writer.add_scalar("Policy/alpha", alpha, it)
+ 
+             # Log performance
+             fps = int(collection_size / (collect_time + learn_time))
+@@ -247,6 +255,9 @@
+                 f"""{"Collection time:":>{pad}} {collect_time:.3f}s \n"""
+                 f"""{"Learning time:":>{pad}} {learn_time:.3f}s \n"""
+             )
++
++            if alpha is not None:
++                log_string += f"""{"Alpha:":>{pad}} {alpha:.6f}\n"""
+ 
+             # Print losses
+             for key, value in loss_dict.items():

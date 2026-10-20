@@ -189,6 +189,8 @@ def handle_deprecated_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, installed_versio
         if installed_version < _V5_0_0:
             for model_name in _MODEL_CFG_NAMES:
                 if _has_non_missing_attr(agent_cfg, model_name):
+                    if getattr(getattr(agent_cfg, model_name), "class_name", "").startswith("SAC"):
+                        continue
                     _validate_old_stochastic_cfg(getattr(agent_cfg, model_name))
         else:  # rsl-rl >= 5.0.0
             # import new distribution config classes
@@ -196,6 +198,8 @@ def handle_deprecated_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, installed_versio
 
             for model_name in _MODEL_CFG_NAMES:
                 if _has_non_missing_attr(agent_cfg, model_name):
+                    if getattr(getattr(agent_cfg, model_name), "class_name", "").startswith("SAC"):
+                        continue
                     _update_distribution_cfg(getattr(agent_cfg, model_name), RslRlMLPModelCfg)
 
     return agent_cfg
