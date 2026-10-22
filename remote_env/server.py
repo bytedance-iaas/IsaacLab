@@ -1,5 +1,6 @@
 """Isaac Lab 3.0 gRPC env server: reuses the stock train entrypoint to launch the sim and build the env,
-then replaces OnPolicyRunner.learn with a serving loop (all sim calls on the main thread)."""
+then swaps the rsl_rl runners for an env-only stub whose learn() is a serving loop (all sim calls on the main
+thread). The server is algorithm-agnostic: the same process serves PPO and SAC learners."""
 import os, queue, sys, threading, time
 from concurrent import futures
 import warp as wp
@@ -23,9 +24,16 @@ def serve(self, *a, **k):
     def handle(method, req):
         ts, meta = wire.unpack(req)
         if method == "Init":
-            return wire.pack(meta={"num_envs": N, "num_actions": env.num_actions,
-                                   "max_episode_length": int(env.max_episode_length),
-                                   "is_finite_horizon": bool(env.unwrapped.cfg.is_finite_horizon), "task": "v3"})
+            # SAC derives per-joint action scaling from these (rsl_rl SAC._compute_action_scaling)
+            robot = env.unwrapped.scene["robot"]
+            scale = 1.0
+            for term in env.unwrapped.action_manager._terms.values():
+                if isinstance(getattr(term.cfg, "scale", None), (float, int)): scale = float(term.cfg.scale); break
+            robot_t = {"robot/soft_limits": robot.data.soft_joint_pos_limits[0].float().cpu(),
+                       "robot/default_pos": robot.data.default_joint_pos[0].float().cpu()}
+            return wire.pack(robot_t, {"num_envs": N, "num_actions": env.num_actions, "action_scale": scale,
+                                       "max_episode_length": int(env.max_episode_length),
+                                       "is_finite_horizon": bool(env.unwrapped.cfg.is_finite_horizon)})
         if method == "Reset":
             obs, extras = env.reset(); return wire.pack(obs_tensors(obs), {"log": scalar_logs(extras)})
         if method == "GetObs":
@@ -62,7 +70,19 @@ def serve(self, *a, **k):
     server.stop(2)
     raise SystemExit(0)
 
+class EnvOnlyRunner:
+    """Stands in for OnPolicyRunner / OffPolicyRunner: keeps the env, builds no policy or replay buffer."""
+
+    def __init__(self, env, train_cfg, log_dir=None, device="cpu"):
+        self.env = env
+
+    def add_git_repo_to_log(self, *a, **k):
+        pass
+
+    learn = serve
+
+
 import rsl_rl.runners as R
-R.OnPolicyRunner.learn = serve
+R.OnPolicyRunner = R.OffPolicyRunner = EnvOnlyRunner
 from isaaclab_rl.entrypoints import run_train_cli
 sys.exit(run_train_cli(sys.argv[1:]))

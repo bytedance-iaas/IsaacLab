@@ -3,8 +3,17 @@ import grpc
 import torch
 from rsl_rl.env import VecEnv
 from tensordict import TensorDict
+from types import SimpleNamespace
 
 import wire
+
+
+def _robot_view(ts, action_scale):
+    """Just enough of env.unwrapped (scene['robot'] and the action scale) for SAC's action scaling."""
+    robot = SimpleNamespace(data=SimpleNamespace(soft_joint_pos_limits=ts["robot/soft_limits"].unsqueeze(0),
+                                                 default_joint_pos=ts["robot/default_pos"].unsqueeze(0)))
+    term = SimpleNamespace(cfg=SimpleNamespace(scale=action_scale))
+    return SimpleNamespace(scene={"robot": robot}, action_manager=SimpleNamespace(_terms={"action": term}))
 
 
 class RemoteVecEnv(VecEnv):
@@ -19,7 +28,8 @@ class RemoteVecEnv(VecEnv):
             m: self._ch.unary_unary(f"/{wire.SERVICE}/{m}", request_serializer=None, response_deserializer=None)
             for m in wire.METHODS
         }
-        _, info = self._call("Init")
+        robot_ts, info = self._call("Init")
+        self.unwrapped = _robot_view(robot_ts, info["action_scale"])
         self.num_envs = info["num_envs"]
         self.num_actions = info["num_actions"]
         self.max_episode_length = info["max_episode_length"]

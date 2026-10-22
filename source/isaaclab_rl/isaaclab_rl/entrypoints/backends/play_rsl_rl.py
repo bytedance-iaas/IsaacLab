@@ -14,7 +14,7 @@ import time
 
 import torch
 from packaging import version
-from rsl_rl.runners import DistillationRunner, OffPolicyRunner, OnPolicyRunner
+from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.app import add_launcher_args, launch_simulation
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
@@ -184,6 +184,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             if agent_cfg.class_name == "OnPolicyRunner":
                 runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
             elif agent_cfg.class_name == "OffPolicyRunner":
+                from rsl_rl.runners import OffPolicyRunner  # only present with sac_port applied
+
                 runner = OffPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
             elif agent_cfg.class_name == "DistillationRunner":
                 runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
