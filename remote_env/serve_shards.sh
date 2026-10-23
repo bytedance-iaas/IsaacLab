@@ -9,7 +9,7 @@ TARGETS=""
 for i in $(seq 0 $((N - 1))); do
   p=$((BASE + i)); TARGETS="$TARGETS,localhost:$p"
   ENV_PORT=$p python -u server.py --rl_library rsl_rl --task=${TASK:-Isaac-Velocity-Flat-G1} --device cpu \
-    --num_envs $((TOTAL / N)) --max_iterations 1 --seed $((42 + i)) physics=${PHYSICS:-newton_mjwarp} agent.device=cpu \
+    --num_envs $((TOTAL / N + (i < TOTAL % N ? 1 : 0))) --max_iterations 1 --seed $((42 + i)) physics=${PHYSICS:-newton_mjwarp} agent.device=cpu \
     --run_name shard$i > "$LOGDIR/shard_$i.log" 2>&1 &
 done
 until [ "$(grep -l "listening on" "$LOGDIR"/shard_*.log 2>/dev/null | wc -l)" -ge "$N" ]; do sleep 5; done

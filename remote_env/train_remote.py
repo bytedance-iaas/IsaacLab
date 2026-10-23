@@ -11,9 +11,7 @@ p = argparse.ArgumentParser()
 p.add_argument("--task", default="Isaac-Velocity-Flat-G1")
 p.add_argument("--agent", default="rsl_rl_cfg_entry_point", help="rsl_rl_cfg_entry_point (PPO) or rsl_rl_sac_cfg_entry_point (SAC)")
 p.add_argument("--target", required=True, help="host:port[,host:port...]")
-p.add_argument("--async_collect", type=int, default=1, help="1: shards step without a per-step barrier")
-p.add_argument("--overlap", type=int, default=1, help="1: SAC collects the next rollout while updating (ignored for PPO)")
-p.add_argument("--collect_device", default=None, help="policy device for collection; default cpu with >1 shard, else --device")
+p.add_argument("--async_collect", type=int, default=1, help="1: with more than one shard, shards step without a per-step barrier")
 p.add_argument("--authority", default=None)
 p.add_argument("--iters", type=int, default=1500)
 p.add_argument("--seed", type=int, default=42)
@@ -39,12 +37,7 @@ env = MultiRemoteVecEnv(args.target.split(","), os.environ["ENV_TOKEN"], authori
 print("connected:", env.cfg, "agent:", agent_cfg.class_name, flush=True)
 log_dir = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.run_name)
 runner = getattr(rsl_rl.runners, agent_cfg.class_name)(env, agent_cfg.to_dict(), log_dir=log_dir, device=args.device)
-if args.async_collect or (args.overlap and agent_cfg.class_name == "OffPolicyRunner"):
-    if args.collect_device == "cpu" or (args.collect_device is None and len(env.shards) > 1):
-        torch.set_num_threads(1)  # many shard threads each run a small CPU forward
-    runner.async_collect, runner.overlap = bool(args.async_collect), bool(args.overlap)
-    runner.collect_device = args.collect_device or ("cpu" if len(env.shards) > 1 else args.device)
-    runner.start_training = getattr(runner, "start_training", 0)
+if args.async_collect and len(env.shards) > 1:
     runner.learn = types.MethodType(async_runner.learn, runner)
 start_it = 0
 if args.resume:
