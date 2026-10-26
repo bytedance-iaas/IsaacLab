@@ -1012,10 +1012,10 @@ class NewtonManager(PhysicsManager):
                     cls._solver.notify_model_changed(change)
                 NewtonManager._model_changes = set()
 
-        # Lazy CUDA graph capture
+        # Lazy graph capture
         cfg = PhysicsManager._cfg
         device = PhysicsManager._device
-        capture_pending = cls._graph_capture_pending and cfg is not None and cfg.use_cuda_graph and "cuda" in device  # type: ignore[union-attr]
+        capture_pending = cls._graph_capture_pending and cfg is not None and cfg.use_cuda_graph  # type: ignore[union-attr]
         state_reconciled = False
         if capture_pending and cls._usdrt_stage is None:
             # Reconcile reset-authored solver resources before standard capture.
@@ -1049,7 +1049,7 @@ class NewtonManager(PhysicsManager):
             cls.forward()
 
         physics_dt = cls._solver_dt * cls._num_substeps
-        use_graph = cfg is not None and cfg.use_cuda_graph and cls._graph is not None and "cuda" in device  # type: ignore[union-attr]
+        use_graph = cfg is not None and cfg.use_cuda_graph and cls._graph is not None  # type: ignore[union-attr]
 
         if cls._is_all_graphable():
             # --- All actuators are graph-safe: actuators + solver in one graph ---
@@ -2360,14 +2360,18 @@ class NewtonManager(PhysicsManager):
         * **RTX active**: defers capture to the first :meth:`step` call
           via :meth:`_capture_relaxed_graph`, because RTX background
           streams are not yet idle during initialisation.
-        * **CUDA graphs disabled**: clears the graph reference.
+        * **Graphs disabled**: clears the graph reference.
+
+        Warp captures a graph on CUDA devices and, through API capture, on CPU devices as well, where
+        replaying the recorded launch stream removes the per-launch dispatch cost. Capture is therefore
+        gated on :attr:`NewtonCfg.use_cuda_graph` alone, not on the device kind.
         """
         cfg = PhysicsManager._cfg
         device = PhysicsManager._device
         if cfg is None or device is None:
             return
 
-        use_cuda_graph = cfg.use_cuda_graph and "cuda" in device
+        use_cuda_graph = cfg.use_cuda_graph
         if use_cuda_graph and not cls._supports_cuda_graph_capture():
             NewtonManager._graph = None
             NewtonManager._graph_capture_pending = False
