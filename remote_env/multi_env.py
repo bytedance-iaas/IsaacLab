@@ -1,10 +1,10 @@
 """One rsl_rl VecEnv over one or more remote env servers (env shards); shards are stepped in parallel."""
+
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from rsl_rl.env import VecEnv
-
 from client import RemoteVecEnv
+from rsl_rl.env import VecEnv
 
 
 class MultiRemoteVecEnv(VecEnv):
@@ -28,7 +28,7 @@ class MultiRemoteVecEnv(VecEnv):
     def merge_extras(extras: list[dict]) -> dict:
         logs = [e["log"] for e in extras]
         keys = set().union(*logs)
-        out = {"log": {k: sum(l[k] for l in logs if k in l) / sum(1 for l in logs if k in l) for k in keys}}
+        out = {"log": {k: sum(lg[k] for lg in logs if k in lg) / sum(1 for lg in logs if k in lg) for k in keys}}
         if all("time_outs" in e for e in extras):
             out["time_outs"] = torch.cat([e["time_outs"] for e in extras])
         return out
@@ -55,8 +55,12 @@ class MultiRemoteVecEnv(VecEnv):
 
     def step(self, actions):
         res = self.map(lambda s, a: s.step(a), list(actions.detach().float().cpu().split(self.sizes)))
-        return (torch.cat([r[0] for r in res]), torch.cat([r[1] for r in res]), torch.cat([r[2] for r in res]),
-                self.merge_extras([r[3] for r in res]))
+        return (
+            torch.cat([r[0] for r in res]),
+            torch.cat([r[1] for r in res]),
+            torch.cat([r[2] for r in res]),
+            self.merge_extras([r[3] for r in res]),
+        )
 
     def close(self):
         self.map(lambda s, _: s.close())

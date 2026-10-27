@@ -6,6 +6,7 @@ not change during the rollout; the rollout is then replayed step by step through
 act / process_env_step with the executed actions. For PPO, normalizer updates are applied once per rollout instead
 of once per step, which is the only difference from the stock loop.
 """
+
 import os
 import threading
 import time
@@ -50,8 +51,9 @@ def _collect(env, actor, device, obs, steps):
     records = []
     for t in range(steps):
         rows = [ps[t] for ps in per_shard]
-        records.append(tuple(torch.cat([r[i] for r in rows]) for i in range(5))
-                       + (env.merge_extras([r[5] for r in rows]),))
+        records.append(
+            tuple(torch.cat([r[i] for r in rows]) for i in range(5)) + (env.merge_extras([r[5] for r in rows]),)
+        )
     return records, records[-1][2]
 
 
@@ -84,7 +86,9 @@ def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = Fals
     off_policy = hasattr(self.alg, "replay_buffer")
     steps = self.cfg["num_steps_per_env"]
     if init_at_random_ep_len:
-        self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
+        self.env.episode_length_buf = torch.randint_like(
+            self.env.episode_length_buf, high=int(self.env.max_episode_length)
+        )
     obs = self.env.get_observations()
     self.alg.train_mode()
     self.logger.init_logging_writer()
@@ -99,14 +103,31 @@ def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = Fals
         t2 = time.time()
         self.current_learning_iteration = it
         if off_policy:
-            self.logger.log(it=it, start_it=start_it, total_it=total_it, collect_time=t1 - t0, learn_time=t2 - t1,
-                            loss_dict=loss_dict, learning_rate=self.alg.actor_learning_rate,
-                            action_std=self.alg.get_policy().output_std, rnd_weight=None,
-                            alpha=getattr(self.alg, "alpha", None), collection_size_override=steps * self.env.num_envs)
+            self.logger.log(
+                it=it,
+                start_it=start_it,
+                total_it=total_it,
+                collect_time=t1 - t0,
+                learn_time=t2 - t1,
+                loss_dict=loss_dict,
+                learning_rate=self.alg.actor_learning_rate,
+                action_std=self.alg.get_policy().output_std,
+                rnd_weight=None,
+                alpha=getattr(self.alg, "alpha", None),
+                collection_size_override=steps * self.env.num_envs,
+            )
         else:
-            self.logger.log(it=it, start_it=start_it, total_it=total_it, collect_time=t1 - t0, learn_time=t2 - t1,
-                            loss_dict=loss_dict, learning_rate=self.alg.learning_rate,
-                            action_std=self.alg.get_policy().output_std, rnd_weight=None)
+            self.logger.log(
+                it=it,
+                start_it=start_it,
+                total_it=total_it,
+                collect_time=t1 - t0,
+                learn_time=t2 - t1,
+                loss_dict=loss_dict,
+                learning_rate=self.alg.learning_rate,
+                action_std=self.alg.get_policy().output_std,
+                rnd_weight=None,
+            )
         if self.logger.writer is not None and it % self.cfg["save_interval"] == 0 and (it != 0 or not off_policy):
             self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))
     if self.logger.writer is not None:

@@ -5,7 +5,12 @@
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlOffPolicyRunnerCfg, RslRlSacActorModelCfg, RslRlSacAlgorithmCfg, RslRlSacCriticModelCfg
+from isaaclab_rl.rsl_rl import (
+    RslRlOffPolicyRunnerCfg,
+    RslRlSacActorModelCfg,
+    RslRlSacAlgorithmCfg,
+    RslRlSacCriticModelCfg,
+)
 
 
 @configclass

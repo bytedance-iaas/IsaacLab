@@ -1,17 +1,23 @@
 """rsl_rl VecEnv that forwards to a remote Isaac Lab env served by server.py."""
-import grpc
-import torch
-from rsl_rl.env import VecEnv
-from tensordict import TensorDict
+
+import contextlib
 from types import SimpleNamespace
 
+import grpc
+import torch
 import wire
+from rsl_rl.env import VecEnv
+from tensordict import TensorDict
 
 
 def _robot_view(ts, action_scale):
     """Just enough of env.unwrapped (scene['robot'] and the action scale) for SAC's action scaling."""
-    robot = SimpleNamespace(data=SimpleNamespace(soft_joint_pos_limits=ts["robot/soft_limits"].unsqueeze(0),
-                                                 default_joint_pos=ts["robot/default_pos"].unsqueeze(0)))
+    robot = SimpleNamespace(
+        data=SimpleNamespace(
+            soft_joint_pos_limits=ts["robot/soft_limits"].unsqueeze(0),
+            default_joint_pos=ts["robot/default_pos"].unsqueeze(0),
+        )
+    )
     term = SimpleNamespace(cfg=SimpleNamespace(scale=action_scale))
     return SimpleNamespace(scene={"robot": robot}, action_manager=SimpleNamespace(_terms={"action": term}))
 
@@ -36,14 +42,11 @@ class RemoteVecEnv(VecEnv):
         self.cfg = info
         self.device = "cpu"
         self._episode_length_buf = torch.zeros(self.num_envs, dtype=torch.long)
-        self.last_rpc_s = 0.0
 
     def _call(self, method, tensors=None, meta=None):
-        import time
-
-        t0 = time.perf_counter()
-        resp = self._rpc[method](wire.pack(tensors, meta), metadata=self._md, timeout=self._timeout, wait_for_ready=True)
-        self.last_rpc_s = time.perf_counter() - t0
+        resp = self._rpc[method](
+            wire.pack(tensors, meta), metadata=self._md, timeout=self._timeout, wait_for_ready=True
+        )
         return wire.unpack(resp)
 
     def _obs(self, ts):
@@ -74,8 +77,6 @@ class RemoteVecEnv(VecEnv):
         return self._obs(ts), ts["rew"], ts["dones"], extras
 
     def close(self):
-        try:
+        with contextlib.suppress(grpc.RpcError):
             self._call("Close")
-        except grpc.RpcError:
-            pass
         self._ch.close()
