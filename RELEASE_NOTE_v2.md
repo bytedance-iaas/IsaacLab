@@ -132,4 +132,3 @@ python remote_env/train_remote.py --task Isaac-Velocity-Flat-G1 --target $T \
 # 3. 取检查点: logs/rsl_rl/<实验名>/<时间戳>_remote/model_<迭代>.pt
 ```
 
-异构与纯 NVIDIA 的用法、全部参数、调优建议见 `USER_GUIDE_v2.md`。
