@@ -18,7 +18,9 @@ import torch
 p = argparse.ArgumentParser()
 p.add_argument("--task", default="Isaac-Velocity-Flat-G1")
 p.add_argument(
-    "--agent", default="rsl_rl_cfg_entry_point", help="rsl_rl_cfg_entry_point (PPO) or rsl_rl_sac_cfg_entry_point (SAC)"
+    "--agent",
+    default="rsl_rl_cfg_entry_point",
+    help="rsl_rl_cfg_entry_point (PPO), rsl_rl_sac_cfg_entry_point (SAC) or rsl_rl_flashsac_cfg_entry_point (FlashSAC)",
 )
 p.add_argument("--target", required=True, help="host:port[,host:port...]")
 p.add_argument(

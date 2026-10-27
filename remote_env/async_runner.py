@@ -36,18 +36,23 @@ class _DeferredNormalization:
 def _collect(env, actor, device, obs, steps):
     """Roll the actor for `steps` steps on every shard; returns per-step full-batch records and the last observation."""
     lock = threading.Lock()
+    # An actor with per-environment noise state (FlashSAC) is told which environments a shard holds
+    stateful = getattr(actor, "stateful_noise", False)
+    starts = [sum(env.sizes[:i]) for i in range(len(env.sizes))]
 
-    def run(shard, o):
+    def run(shard, arg):
+        o, start, size = arg
+        kw = {"env_ids": slice(start, start + size)} if stateful else {}
         recs = []
         for _ in range(steps):
             with torch.inference_mode(), lock:
-                a = actor(o.to(device), stochastic_output=True).cpu()
+                a = actor(o.to(device), stochastic_output=True, **kw).cpu()
             nxt, rew, done, extras = shard.step(a)
             recs.append((o, a, nxt, rew, done, extras))
             o = nxt
         return recs
 
-    per_shard = env.map(run, list(obs.split(env.sizes)))
+    per_shard = env.map(run, list(zip(obs.split(env.sizes), starts, env.sizes)))
     records = []
     for t in range(steps):
         rows = [ps[t] for ps in per_shard]
@@ -63,7 +68,10 @@ def _replay(runner, records, last_obs, off_policy):
 
     def feed():
         for o, a, nxt, rew, done, extras in records:
-            alg.act(o.to(dev))  # fills the transition (and, for PPO, values and the action distribution)
+            if getattr(alg.actor, "stateful_noise", False):
+                alg.transition.observations = o.to(dev)  # acting again would advance the noise state
+            else:
+                alg.act(o.to(dev))  # fills the transition (and, for PPO, values and the action distribution)
             a = a.to(dev)
             alg.transition.actions = a  # the action that was actually executed
             if not off_policy:

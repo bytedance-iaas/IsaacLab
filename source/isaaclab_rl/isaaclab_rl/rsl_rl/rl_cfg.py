@@ -183,6 +183,45 @@ class RslRlSacCriticModelCfg:
     layer_norm: bool = MISSING
 
 
+@configclass
+class RslRlFlashSacActorModelCfg:
+    """Configuration for the FlashSAC actor model."""
+
+    class_name: str = "FlashSACActorModel"
+    hidden_dim: int = 128
+    """Width of the residual blocks."""
+
+    num_blocks: int = 2
+    """Number of residual blocks."""
+
+    log_std_min: float = -10.0
+    log_std_max: float = 2.0
+
+    noise_repeat_mu: float = 2.0
+    """Exponent of the Zeta distribution from which exploration-noise repeat lengths are drawn."""
+
+    noise_repeat_max: int = 16
+    """Longest exploration-noise repeat length, in environment steps."""
+
+
+@configclass
+class RslRlFlashSacCriticModelCfg:
+    """Configuration for the FlashSAC categorical twin critic."""
+
+    class_name: str = "FlashSACCriticModel"
+    hidden_dim: int = 256
+    """Width of the residual blocks."""
+
+    num_blocks: int = 2
+    """Number of residual blocks."""
+
+    num_bins: int = 101
+    """Number of value atoms."""
+
+    v_max: float = 5.0
+    """The atoms span [-v_max, v_max] in units of the normalized reward."""
+
+
 ############################
 # Algorithm configurations #
 ############################
@@ -212,6 +251,39 @@ class RslRlSacAlgorithmCfg:
     critic_optimizer: Literal["adam", "adamw", "sgd", "rmsprop"] = "adam"
     rnd_cfg: RslRlRndCfg | None = None
     symmetry_cfg: RslRlSymmetryCfg | None = None
+
+
+@configclass
+class RslRlFlashSacAlgorithmCfg:
+    """Configuration for the FlashSAC algorithm."""
+
+    class_name: str = "FlashSAC"
+    replay_buffer_size: int = 10_000_000
+    num_mini_batches: int = 48
+    """Gradient steps per learning iteration."""
+
+    mini_batch_size: int = 2048
+    learning_rate: float = 3.0e-4
+    """Initial learning rate; decays with a cosine schedule over the training run."""
+
+    learning_rate_end: float = 1.5e-4
+    gamma: float = 0.99
+    n_steps: int = 3
+    tau: float = 0.01
+    temperature: float = 0.01
+    """Initial entropy temperature."""
+
+    target_action_std: float = 0.15
+    """Entropy target, expressed as the std of a Gaussian per action dimension."""
+
+    actor_update_period: int = 2
+    """Critic steps per actor and temperature step."""
+
+    normalize_reward: bool = True
+    """Whether to scale rewards by the running discounted-return statistics."""
+
+    rnd_cfg: dict | None = None
+    """Not supported; kept because the rsl_rl logger reads it."""
 
 
 @configclass
@@ -420,6 +492,15 @@ class RslRlOffPolicyRunnerCfg(RslRlBaseRunnerCfg):
     algorithm: RslRlSacAlgorithmCfg = MISSING
     log_interval: int = MISSING
     start_training: int = MISSING
+
+
+@configclass
+class RslRlFlashSacRunnerCfg(RslRlOffPolicyRunnerCfg):
+    """Configuration of the off-policy runner with FlashSAC."""
+
+    actor: RslRlFlashSacActorModelCfg = RslRlFlashSacActorModelCfg()
+    critic: RslRlFlashSacCriticModelCfg = RslRlFlashSacCriticModelCfg()
+    algorithm: RslRlFlashSacAlgorithmCfg = RslRlFlashSacAlgorithmCfg()
 
 
 #############################

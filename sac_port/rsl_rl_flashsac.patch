@@ -1,0 +1,767 @@
+diff -ruN pa/rsl_rl/algorithms/__init__.py pb/rsl_rl/algorithms/__init__.py
+--- pa/rsl_rl/algorithms/__init__.py	2026-10-27 14:47:14
++++ pb/rsl_rl/algorithms/__init__.py	2026-10-27 14:53:19
+@@ -12,3 +12,6 @@
+ 
+ from .sac import SAC
+ __all__ = list(__all__) + ["SAC"]
++
++from .flashsac import FlashSAC
++__all__ = list(__all__) + ["FlashSAC"]
+diff -ruN pa/rsl_rl/algorithms/flashsac.py pb/rsl_rl/algorithms/flashsac.py
+--- pa/rsl_rl/algorithms/flashsac.py	1969-12-31 16:00:00
++++ pb/rsl_rl/algorithms/flashsac.py	2026-10-27 15:01:17
+@@ -0,0 +1,387 @@
++# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""FlashSAC (https://arxiv.org/abs/2604.04539), ported from https://github.com/Holiday-Robot/FlashSAC
++(MIT License, Copyright (c) 2026 Holiday Robotics) onto the rsl_rl replay buffer and OffPolicyRunner."""
++
++from __future__ import annotations
++
++import copy
++import math
++
++import torch
++import torch.optim as optim
++from tensordict import TensorDict
++
++from rsl_rl.env import VecEnv
++from rsl_rl.models import FlashSACActorModel, FlashSACCriticModel
++from rsl_rl.models.flashsac_model import _normalize_parameters
++from rsl_rl.storage import ReplayBuffer
++from rsl_rl.utils import resolve_callable, resolve_obs_groups
++
++
++class _ReturnNormalizer:
++    """Scales rewards by max(std of the running discounted return, max |return| / return_max)."""
++
++    def __init__(self, num_envs: int, gamma: float, return_max: float, device: str) -> None:
++        self.gamma = gamma
++        self.return_max = return_max
++        self.ret = torch.zeros(num_envs, device=device)
++        self.ret_abs_max = torch.zeros((), device=device)
++        self.mean = torch.zeros((), device=device)
++        self.var = torch.ones((), device=device)
++        self.count = torch.zeros((), device=device)
++
++    def update(self, rewards: torch.Tensor, dones: torch.Tensor) -> None:
++        self.ret = self.gamma * (1.0 - dones.float()) * self.ret + rewards
++        self.ret_abs_max = torch.maximum(self.ret_abs_max, self.ret.abs().max())
++        # Parallel mean / variance update with the batch of per-environment returns
++        n = self.ret.numel()
++        delta = self.ret.mean() - self.mean
++        total = self.count + n
++        m2 = self.var * (self.count + 1e-4) + self.ret.var(unbiased=False) * n + delta.pow(2) * self.count * n / total
++        self.mean = self.mean + delta * n / total
++        self.var = m2 / total
++        self.count = total
++
++    def normalize(self, rewards: torch.Tensor) -> torch.Tensor:
++        return rewards / torch.maximum(torch.sqrt(self.var + 1e-8), self.ret_abs_max / self.return_max)
++
++    def state_dict(self) -> dict:
++        return {k: getattr(self, k) for k in ("ret", "ret_abs_max", "mean", "var", "count")}
++
++    def load_state_dict(self, state: dict) -> None:
++        for k, v in state.items():
++            setattr(self, k, v.to(self.ret.device))
++
++
++class FlashSAC:
++    """FlashSAC: SAC with norm-bounded residual networks, a categorical twin critic, return-based reward scaling,
++    an action-dimension-scaled entropy target and repeated exploration noise.
++
++    Each :meth:`update` takes ``num_mini_batches`` gradient steps on ``mini_batch_size`` uniformly sampled
++    transitions. The critic is updated every step, the actor and temperature every ``actor_update_period`` steps.
++    """
++
++    actor: FlashSACActorModel
++    """The actor model."""
++
++    critic: FlashSACCriticModel
++    """The critic model."""
++
++    def __init__(
++        self,
++        actor: FlashSACActorModel,
++        critic: FlashSACCriticModel,
++        replay_buffer: ReplayBuffer,
++        num_envs: int,
++        num_lr_updates: int,
++        replay_buffer_size: int = 10_000_000,
++        num_mini_batches: int = 48,
++        mini_batch_size: int = 2048,
++        learning_rate: float = 3e-4,
++        learning_rate_end: float = 1.5e-4,
++        gamma: float = 0.99,
++        n_steps: int = 3,
++        tau: float = 0.01,
++        temperature: float = 0.01,
++        target_action_std: float = 0.15,
++        actor_update_period: int = 2,
++        normalize_reward: bool = True,
++        device: str = "cpu",
++        rnd_cfg: dict | None = None,
++        multi_gpu_cfg: dict | None = None,
++    ) -> None:
++        """Initialize the FlashSAC algorithm.
++
++        Args:
++            actor: The FlashSAC actor model.
++            critic: The FlashSAC critic model.
++            replay_buffer: An instance of the ReplayBuffer class.
++            num_envs: Number of environments, for the running discounted return.
++            num_lr_updates: Number of gradient steps over which the learning rate decays.
++            replay_buffer_size: Max replay buffer size (used when constructing the buffer).
++            num_mini_batches: Gradient steps per update.
++            mini_batch_size: Transitions per gradient step.
++            learning_rate: Initial learning rate of the actor, critic and temperature.
++            learning_rate_end: Learning rate at the end of the cosine decay.
++            gamma: Discount factor.
++            n_steps: Number of steps for n-step returns (used when constructing the buffer).
++            tau: Target critic update rate.
++            temperature: Initial entropy temperature.
++            target_action_std: Entropy target expressed as the std of a Gaussian per action dimension.
++            actor_update_period: Critic steps per actor and temperature step.
++            normalize_reward: Whether to scale rewards with the running discounted return.
++            device: Device for the models and buffers.
++            rnd_cfg: Must be None; RND is not supported.
++            multi_gpu_cfg: Must be None; multi-GPU training is not supported.
++        """
++        if rnd_cfg is not None or multi_gpu_cfg is not None:
++            raise NotImplementedError("FlashSAC supports neither RND nor multi-GPU training.")
++        self.device = device
++        self.rnd = None
++        self.actor = actor.to(device)
++        self.critic = critic.to(device)
++        self.target_critic = copy.deepcopy(self.critic).requires_grad_(False)
++        self.replay_buffer = replay_buffer
++        self.transition = ReplayBuffer.Transition()
++
++        self.num_mini_batches = num_mini_batches
++        self.mini_batch_size = mini_batch_size
++        self.gamma = gamma
++        self.tau = tau
++        self.actor_update_period = actor_update_period
++        self.target_entropy = 0.5 * actor.output_dim * math.log(2 * math.pi * math.e * target_action_std**2)
++        self.update_step = 0
++
++        self.log_temperature = torch.tensor(math.log(temperature), device=device, requires_grad=True)
++        self.alpha = temperature
++        fused = torch.device(device).type == "cuda"
++        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=learning_rate, fused=fused)
++        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=learning_rate, fused=fused)
++        self.temperature_optimizer = optim.Adam([self.log_temperature], lr=learning_rate)
++
++        def cosine(step: int) -> float:
++            progress = min(step / max(num_lr_updates, 1), 1.0)
++            end = learning_rate_end / learning_rate
++            return end + (1.0 - end) * 0.5 * (1.0 + math.cos(math.pi * progress))
++
++        # Each scheduler steps with its own optimizer, as in the reference implementation
++        self.schedulers = [
++            optim.lr_scheduler.LambdaLR(o, cosine)
++            for o in (self.actor_optimizer, self.critic_optimizer, self.temperature_optimizer)
++        ]
++        self.actor_learning_rate = learning_rate
++        self.reward_normalizer = _ReturnNormalizer(num_envs, gamma, critic.v_max, device) if normalize_reward else None
++
++    def act(self, obs: TensorDict) -> torch.Tensor:
++        """Select an action with the repeated exploration noise."""
++        with torch.no_grad():
++            action = self.actor(obs, stochastic_output=True)
++            self.transition.observations = obs
++            self.transition.actions = action
++            return action
++
++    def process_env_step(self, next_obs: TensorDict, rew: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
++        """Store the transition; time-outs bootstrap from the next observation (the reset observation)."""
++        time_outs = extras["time_outs"].to(self.device) if "time_outs" in extras else torch.zeros_like(dones)
++        if self.reward_normalizer is not None:
++            self.reward_normalizer.update(rew, dones)
++        self.transition.rewards = rew
++        self.transition.next_observations = next_obs
++        self.transition.dones = dones
++        self.transition.bootstrap = time_outs.to(dones.dtype)
++        self.replay_buffer.add_transition(self.transition)
++        self.transition.clear()
++
++    def update(self) -> dict:
++        """Run ``num_mini_batches`` gradient steps, returning mean losses."""
++        sums = {"critic": 0.0, "actor": 0.0, "temperature": 0.0, "entropy": 0.0}
++        num_actor_steps = 0
++        for obs, actions, rewards, next_obs, dones, bootstrap, n_steps in self.replay_buffer.mini_batch_generator(
++            num_mini_batch=self.num_mini_batches, mini_batch_size=self.mini_batch_size
++        ):
++            actor_obs = torch.cat([self.actor.get_latent(obs), self.actor.get_latent(next_obs)])
++            critic_obs = torch.cat([self.critic.get_latent(obs), self.critic.get_latent(next_obs)])
++            rewards = rewards.squeeze(-1)
++            if self.reward_normalizer is not None:
++                rewards = self.reward_normalizer.normalize(rewards)
++            # 1 where the target bootstraps (no termination within the n steps), 0 at terminations
++            discount = (self.gamma ** n_steps.squeeze(-1).float()) * (bootstrap + 1 - dones).squeeze(-1)
++
++            if self.update_step % self.actor_update_period == 0:
++                actor_loss, temperature_loss, entropy = self._update_actor(actor_obs, critic_obs)
++                sums["actor"] += actor_loss
++                sums["temperature"] += temperature_loss
++                sums["entropy"] += entropy
++                num_actor_steps += 1
++            sums["critic"] += self._update_critic(actor_obs, critic_obs, actions, rewards, discount)
++            with torch.no_grad():
++                for t, p in zip(self.target_critic.parameters(), self.critic.parameters()):
++                    t.lerp_(p, self.tau)
++            self.update_step += 1
++
++        self.alpha = self.log_temperature.exp().item()
++        self.actor_learning_rate = self.actor_optimizer.param_groups[0]["lr"]
++        return {
++            "critic": sums["critic"] / self.num_mini_batches,
++            "actor": sums["actor"] / max(num_actor_steps, 1),
++            "temperature": sums["temperature"] / max(num_actor_steps, 1),
++            "entropy": sums["entropy"] / max(num_actor_steps, 1),
++        }
++
++    def _update_actor(self, actor_obs: torch.Tensor, critic_obs: torch.Tensor) -> tuple[float, float, float]:
++        b = actor_obs.shape[0] // 2
++        # Current and next observations share one forward pass so that they share BatchNorm statistics
++        actions, log_prob = self.actor.sample(actor_obs, training=True)
++        actions, log_prob = actions[:b], log_prob[:b]
++        self.critic.requires_grad_(False)
++        q, _ = self.critic(critic_obs[:b], actions, training=False)
++        self.critic.requires_grad_(True)
++        temperature = self.log_temperature.exp()
++        actor_loss = (log_prob * temperature.detach() - q.min(dim=0).values).mean()
++        self.actor_optimizer.zero_grad(set_to_none=True)
++        actor_loss.backward()
++        self.actor_optimizer.step()
++        self.schedulers[0].step()
++        _normalize_parameters(self.actor)
++
++        entropy = -log_prob.detach().mean()
++        temperature_loss = temperature * (entropy - self.target_entropy)
++        self.temperature_optimizer.zero_grad(set_to_none=True)
++        temperature_loss.backward()
++        self.temperature_optimizer.step()
++        self.schedulers[2].step()
++        return actor_loss.item(), temperature_loss.item(), entropy.item()
++
++    def _update_critic(
++        self,
++        actor_obs: torch.Tensor,
++        critic_obs: torch.Tensor,
++        actions: torch.Tensor,
++        rewards: torch.Tensor,
++        discount: torch.Tensor,
++    ) -> float:
++        b = actions.shape[0]
++        with torch.no_grad():
++            next_actions, next_log_prob = self.actor.sample(actor_obs[b:], training=False)
++            all_actions = torch.cat([actions, next_actions])
++            target_q, target_log_probs = self.target_critic(critic_obs, all_actions, training=True)
++            # Atom distribution of the critic with the smaller next-state Q, per sample
++            pick = target_q[:, b:].argmin(dim=0)
++            next_log_probs = target_log_probs[:, b:].gather(
++                0, pick.view(1, -1, 1).expand(1, -1, target_log_probs.shape[-1])
++            )[0]
++            entropy_bonus = self.log_temperature.exp() * next_log_prob
++            target_probs = self._project(next_log_probs.exp(), rewards, discount, entropy_bonus)
++
++        _, log_probs = self.critic(critic_obs, all_actions, training=True)
++        critic_loss = -(target_probs.unsqueeze(0) * log_probs[:, :b]).sum(dim=-1).mean()
++        self.critic_optimizer.zero_grad(set_to_none=True)
++        critic_loss.backward()
++        self.critic_optimizer.step()
++        self.schedulers[1].step()
++        _normalize_parameters(self.critic)
++        return critic_loss.item()
++
++    def _project(
++        self, probs: torch.Tensor, rewards: torch.Tensor, discount: torch.Tensor, entropy_bonus: torch.Tensor
++    ) -> torch.Tensor:
++        """Project the shifted atom distribution r + discount * (z - alpha * log_pi) back onto the fixed atoms."""
++        bins = self.critic.bins
++        num_bins, v_max = bins.numel(), self.critic.v_max
++        z = rewards.unsqueeze(-1) + discount.unsqueeze(-1) * (bins - entropy_bonus.unsqueeze(-1))
++        pos = (z.clamp(-v_max, v_max) + v_max) / (2 * v_max / (num_bins - 1))
++        lower = pos.floor().long()
++        upper = (lower + 1).clamp(max=num_bins - 1)
++        frac = pos - lower.float()
++        target = torch.zeros_like(probs)
++        target.scatter_add_(1, lower, probs * (1.0 - frac))
++        target.scatter_add_(1, upper, probs * frac)
++        return target
++
++    def train_mode(self) -> None:
++        """BatchNorm modes are chosen per call, so there is no module mode to switch."""
++
++    def eval_mode(self) -> None:
++        """BatchNorm modes are chosen per call, so there is no module mode to switch."""
++
++    def get_policy(self) -> FlashSACActorModel:
++        """Get the policy model (actor)."""
++        return self.actor
++
++    def save(self) -> dict:
++        """Return a dict of all model states for saving."""
++        saved = {
++            "actor_state_dict": self.actor.state_dict(),
++            "critic_state_dict": self.critic.state_dict(),
++            "target_critic_state_dict": self.target_critic.state_dict(),
++            "actor_optimizer_state_dict": self.actor_optimizer.state_dict(),
++            "critic_optimizer_state_dict": self.critic_optimizer.state_dict(),
++            "temperature_optimizer_state_dict": self.temperature_optimizer.state_dict(),
++            "scheduler_state_dicts": [s.state_dict() for s in self.schedulers],
++            "log_temperature": self.log_temperature.detach().cpu(),
++            "update_step": self.update_step,
++        }
++        if self.reward_normalizer is not None:
++            saved["reward_normalizer"] = self.reward_normalizer.state_dict()
++        return saved
++
++    def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
++        """Load specified models from a saved dict.
++
++        Args:
++            loaded_dict: Dictionary of saved model states.
++            load_cfg: Dictionary specifying which components to load. If None, loads all.
++            strict: Whether to strictly enforce state dict key matching.
++
++        Returns:
++            Whether the iteration counter should be restored.
++        """
++        if load_cfg is None:
++            load_cfg = {"actor": True, "critic": True, "optimizer": True, "iteration": True}
++        if load_cfg.get("actor"):
++            self.actor.load_state_dict(loaded_dict["actor_state_dict"], strict=strict)
++        if load_cfg.get("critic"):
++            self.critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
++            self.target_critic.load_state_dict(loaded_dict["target_critic_state_dict"], strict=strict)
++        if load_cfg.get("optimizer"):
++            self.actor_optimizer.load_state_dict(loaded_dict["actor_optimizer_state_dict"])
++            self.critic_optimizer.load_state_dict(loaded_dict["critic_optimizer_state_dict"])
++            self.temperature_optimizer.load_state_dict(loaded_dict["temperature_optimizer_state_dict"])
++            for s, state in zip(self.schedulers, loaded_dict["scheduler_state_dicts"]):
++                s.load_state_dict(state)
++            with torch.no_grad():
++                self.log_temperature.copy_(loaded_dict["log_temperature"].to(self.device))
++            self.alpha = self.log_temperature.exp().item()
++            self.update_step = loaded_dict["update_step"]
++            if self.reward_normalizer is not None and "reward_normalizer" in loaded_dict:
++                self.reward_normalizer.load_state_dict(loaded_dict["reward_normalizer"])
++        return load_cfg.get("iteration", False)
++
++    @staticmethod
++    def construct_algorithm(obs: TensorDict, env: VecEnv, cfg: dict, device: str) -> FlashSAC:
++        """Construct FlashSAC with actor, critic and replay buffer.
++
++        Args:
++            obs: Initial observations from the environment.
++            env: The vectorized environment.
++            cfg: Configuration dictionary.
++            device: Device to place models on.
++
++        Returns:
++            Initialized FlashSAC instance.
++        """
++        alg_class: type[FlashSAC] = resolve_callable(cfg["algorithm"].pop("class_name"))  # type: ignore
++        actor_class: type[FlashSACActorModel] = resolve_callable(cfg["actor"].pop("class_name"))  # type: ignore
++        critic_class: type[FlashSACCriticModel] = resolve_callable(cfg["critic"].pop("class_name"))  # type: ignore
++        cfg["obs_groups"] = resolve_obs_groups(obs, cfg["obs_groups"], ["actor", "critic"])
++
++        actor = actor_class(obs, cfg["obs_groups"], "actor", env.num_actions, num_envs=env.num_envs, **cfg["actor"])
++        print(f"FlashSAC Actor: {actor}")
++        critic = critic_class(obs, cfg["obs_groups"], "critic", 1, num_actions=env.num_actions, **cfg["critic"])
++        print(f"FlashSAC Critic: {critic}")
++
++        replay_buffer = ReplayBuffer(
++            env.num_envs,
++            cfg["num_steps_per_env"],
++            obs,
++            [env.num_actions],
++            device,
++            buffer_size=cfg["algorithm"].get("replay_buffer_size", 10_000_000),
++            n_steps=cfg["algorithm"].get("n_steps", 3),
++            gamma=cfg["algorithm"].get("gamma", 0.99),
++        )
++        num_lr_updates = cfg["max_iterations"] * cfg["algorithm"].get("num_mini_batches", 48)
++        return alg_class(
++            actor,
++            critic,
++            replay_buffer,
++            num_envs=env.num_envs,
++            num_lr_updates=num_lr_updates,
++            device=device,
++            **cfg["algorithm"],
++            multi_gpu_cfg=cfg.get("multi_gpu"),
++        )
+diff -ruN pa/rsl_rl/models/__init__.py pb/rsl_rl/models/__init__.py
+--- pa/rsl_rl/models/__init__.py	2026-10-27 14:47:14
++++ pb/rsl_rl/models/__init__.py	2026-10-27 14:53:19
+@@ -17,3 +17,6 @@
+ 
+ from .sac_mlp_model import SACActorModel, SACCriticModel
+ __all__ = list(__all__) + ["SACActorModel", "SACCriticModel"]
++
++from .flashsac_model import FlashSACActorModel, FlashSACCriticModel
++__all__ = list(__all__) + ["FlashSACActorModel", "FlashSACCriticModel"]
+diff -ruN pa/rsl_rl/models/flashsac_model.py pb/rsl_rl/models/flashsac_model.py
+--- pa/rsl_rl/models/flashsac_model.py	1969-12-31 16:00:00
++++ pb/rsl_rl/models/flashsac_model.py	2026-10-27 14:52:06
+@@ -0,0 +1,352 @@
++# Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
++# All rights reserved.
++#
++# SPDX-License-Identifier: BSD-3-Clause
++
++"""FlashSAC actor and critic models (https://arxiv.org/abs/2604.04539).
++
++Ported from https://github.com/Holiday-Robot/FlashSAC (MIT License, Copyright (c) 2026 Holiday Robotics). The
++networks are written as ensembles of ``n`` members (``n = 1`` for the actor, ``n = 2`` for the twin critic) in plain
++PyTorch, without torch.compile, mixed precision or fused optimizers, so they run unchanged on CPU, CUDA and NPU.
++"""
++
++from __future__ import annotations
++
++import copy
++import math
++
++import torch
++import torch.nn as nn
++import torch.nn.functional as F
++from tensordict import TensorDict
++
++
++class _Linear(nn.Module):
++    """Bias-free linear layer for an ensemble; weight rows are kept at unit norm by :meth:`normalize`."""
++
++    def __init__(self, n: int, in_dim: int, out_dim: int) -> None:
++        super().__init__()
++        self.weight = nn.Parameter(torch.empty(n, out_dim, in_dim))
++        for w in self.weight.data:
++            nn.init.orthogonal_(w)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return torch.einsum("nbi,noi->nbo", x, self.weight)
++
++    def normalize(self) -> None:
++        self.weight.copy_(F.normalize(self.weight, dim=-1, eps=1e-8))
++
++
++class _BatchNorm(nn.Module):
++    """Batch normalization over the batch axis of ``[n, batch, dim]``; scale and shift are kept at norm sqrt(dim)."""
++
++    def __init__(self, n: int, dim: int, momentum: float = 0.01, eps: float = 1e-5) -> None:
++        super().__init__()
++        self.momentum = momentum
++        self.eps = eps
++        self.weight = nn.Parameter(torch.ones(n, dim))
++        self.bias = nn.Parameter(torch.zeros(n, dim))
++        self.register_buffer("running_mean", torch.zeros(n, dim))
++        self.register_buffer("running_var", torch.ones(n, dim))
++
++    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
++        if training:
++            mean = x.mean(dim=1, keepdim=True)
++            var = x.var(dim=1, unbiased=False, keepdim=True)
++            with torch.no_grad():
++                b = x.shape[1]
++                self.running_mean.lerp_(mean.squeeze(1), self.momentum)
++                self.running_var.lerp_(var.squeeze(1) * (b / (b - 1)), self.momentum)
++        else:
++            mean = self.running_mean.unsqueeze(1)
++            var = self.running_var.unsqueeze(1)
++        return (x - mean) * torch.rsqrt(var + self.eps) * self.weight.unsqueeze(1) + self.bias.unsqueeze(1)
++
++    def normalize(self) -> None:
++        sqsum = (self.weight * self.weight + self.bias * self.bias).sum(dim=-1, keepdim=True)
++        factor = math.sqrt(self.weight.shape[-1]) * torch.rsqrt(sqsum + 1e-8)
++        self.weight.mul_(factor)
++        self.bias.mul_(factor)
++
++
++class _RMSNorm(nn.Module):
++    """RMS normalization over the feature axis; the scale is kept at norm sqrt(dim)."""
++
++    def __init__(self, n: int, dim: int, eps: float = 1e-6) -> None:
++        super().__init__()
++        self.eps = eps
++        self.weight = nn.Parameter(torch.ones(n, dim))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight.unsqueeze(1)
++
++    def normalize(self) -> None:
++        sqsum = (self.weight * self.weight).sum(dim=-1, keepdim=True)
++        self.weight.mul_(math.sqrt(self.weight.shape[-1]) * torch.rsqrt(sqsum + 1e-8))
++
++
++class _Block(nn.Module):
++    """Inverted residual block: expand x4, BatchNorm, ReLU, project back, BatchNorm, ReLU, add the input."""
++
++    def __init__(self, n: int, dim: int, expansion: int = 4) -> None:
++        super().__init__()
++        self.w1 = _Linear(n, dim, dim * expansion)
++        self.norm1 = _BatchNorm(n, dim * expansion)
++        self.w2 = _Linear(n, dim * expansion, dim)
++        self.norm2 = _BatchNorm(n, dim)
++
++    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
++        y = F.relu(self.norm1(self.w1(x), training))
++        y = F.relu(self.norm2(self.w2(y), training))
++        return x + y
++
++
++class _Encoder(nn.Module):
++    """BatchNorm on the input, unit-norm embedding, residual blocks and a final RMSNorm."""
++
++    def __init__(self, n: int, in_dim: int, hidden_dim: int, num_blocks: int) -> None:
++        super().__init__()
++        self.in_norm = _BatchNorm(n, in_dim)
++        self.embed = _Linear(n, in_dim, hidden_dim)
++        self.blocks = nn.ModuleList([_Block(n, hidden_dim) for _ in range(num_blocks)])
++        self.out_norm = _RMSNorm(n, hidden_dim)
++
++    def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
++        x = self.embed(self.in_norm(x, training))
++        for block in self.blocks:
++            x = block(x, training)
++        return self.out_norm(x)
++
++
++def _normalize_parameters(module: nn.Module) -> None:
++    """Project all unit-norm weights back onto their spheres (called after every optimizer step)."""
++    with torch.no_grad():
++        for m in module.modules():
++            if isinstance(m, (_Linear, _BatchNorm, _RMSNorm)):
++                m.normalize()
++
++
++def _obs_dim(obs: TensorDict, obs_groups: dict[str, list[str]], obs_set: str) -> tuple[list[str], int]:
++    groups = obs_groups[obs_set]
++    for group in groups:
++        assert len(obs[group].shape) == 2, "FlashSAC models only support 1D observations."
++    return groups, sum(obs[group].shape[-1] for group in groups)
++
++
++class FlashSACActorModel(nn.Module):
++    """FlashSAC actor: Tanh-squashed Gaussian policy with a bounded log-std and repeated exploration noise.
++
++    During collection (``stochastic_output=True``) each environment keeps its Gaussian noise sample for ``k`` steps,
++    with ``k`` drawn from a truncated Zeta distribution ``P(k) ~ k^-mu``, ``k <= noise_repeat_max``. Actions lie in
++    ``[-1, 1]`` and are passed to the environment as they are.
++    """
++
++    is_recurrent: bool = False
++
++    stateful_noise: bool = True
++    """Calling the actor stochastically advances the per-environment noise state."""
++
++    def __init__(
++        self,
++        obs: TensorDict,
++        obs_groups: dict[str, list[str]],
++        obs_set: str,
++        output_dim: int,
++        num_envs: int,
++        hidden_dim: int = 128,
++        num_blocks: int = 2,
++        log_std_min: float = -10.0,
++        log_std_max: float = 2.0,
++        noise_repeat_mu: float = 2.0,
++        noise_repeat_max: int = 16,
++        **kwargs,
++    ) -> None:
++        """Initialize the actor.
++
++        Args:
++            obs: Observation dictionary.
++            obs_groups: Dictionary mapping observation sets to lists of observation groups.
++            obs_set: Observation set to use for this model (e.g., "actor").
++            output_dim: Dimension of the action space.
++            num_envs: Number of environments, for the per-environment noise state.
++            hidden_dim: Width of the residual blocks.
++            num_blocks: Number of residual blocks.
++            log_std_min: Lower bound of the log standard deviation.
++            log_std_max: Upper bound of the log standard deviation.
++            noise_repeat_mu: Exponent of the Zeta distribution of noise repeat lengths.
++            noise_repeat_max: Longest noise repeat length.
++        """
++        super().__init__()
++        self.obs_groups, self.obs_dim = _obs_dim(obs, obs_groups, obs_set)
++        self.output_dim = output_dim
++        self.log_std_min = log_std_min
++        self.log_std_max = log_std_max
++
++        self.encoder = _Encoder(1, self.obs_dim, hidden_dim, num_blocks)
++        self.head = _Linear(1, hidden_dim, 2 * output_dim)  # mean rows, then log-std rows
++        self.head_bias = nn.Parameter(torch.zeros(2 * output_dim))
++        _normalize_parameters(self)
++
++        k = torch.arange(1, noise_repeat_max + 1, dtype=torch.float32)
++        pmf = k.pow(-noise_repeat_mu)
++        self.register_buffer("noise_repeat_cdf", torch.cumsum(pmf / pmf.sum(), 0), persistent=False)
++        self.register_buffer("noise", torch.zeros(num_envs, output_dim), persistent=False)
++        self.register_buffer("noise_steps_left", torch.zeros(num_envs, dtype=torch.long), persistent=False)
++        self._std = torch.zeros(output_dim)
++
++    def get_latent(self, obs: TensorDict) -> torch.Tensor:
++        return torch.cat([obs[group] for group in self.obs_groups], dim=-1)
++
++    def mean_std(self, x: torch.Tensor, training: bool) -> tuple[torch.Tensor, torch.Tensor]:
++        """Mean and standard deviation of the pre-Tanh Gaussian for flat observations ``x`` of shape [B, obs_dim]."""
++        out = self.head(self.encoder(x.unsqueeze(0), training))[0] + self.head_bias
++        mean, raw_log_std = out.split(self.output_dim, dim=-1)
++        log_std = self.log_std_min + (self.log_std_max - self.log_std_min) * 0.5 * (1 + torch.tanh(raw_log_std))
++        return mean, log_std.exp()
++
++    def sample(self, x: torch.Tensor, training: bool) -> tuple[torch.Tensor, torch.Tensor]:
++        """Reparameterized action sample and its log-probability (with the Tanh correction), shapes [B, A] and [B]."""
++        mean, std = self.mean_std(x, training)
++        eps = torch.randn_like(mean)
++        raw = mean + std * eps
++        log_prob = -0.5 * eps.pow(2) - std.log() - 0.5 * math.log(2 * math.pi)
++        # log(1 - tanh(x)^2) in a numerically safe form
++        log_prob = log_prob - 2.0 * (math.log(2.0) - raw - F.softplus(-2.0 * raw))
++        return torch.tanh(raw), log_prob.sum(dim=-1)
++
++    def forward(
++        self, obs: TensorDict, stochastic_output: bool = False, env_ids: slice | torch.Tensor | None = None, **kwargs
++    ) -> torch.Tensor:
++        """Act with running BatchNorm statistics.
++
++        Args:
++            obs: Observation dictionary.
++            stochastic_output: If True, add the repeated exploration noise; otherwise return the mean action.
++            env_ids: Environments the observations belong to, for the noise state. Defaults to all environments.
++
++        Returns:
++            Actions in [-1, 1].
++        """
++        mean, std = self.mean_std(self.get_latent(obs), training=False)
++        self._std = std
++        if not stochastic_output:
++            return torch.tanh(mean)
++        ids = slice(None) if env_ids is None else env_ids
++        left = self.noise_steps_left[ids]
++        renew = left <= 0
++        u = torch.rand(left.shape, device=left.device)
++        new_k = (self.noise_repeat_cdf <= u.unsqueeze(-1)).sum(dim=-1) + 1
++        noise = torch.where(renew.unsqueeze(-1), torch.randn_like(mean), self.noise[ids])
++        self.noise[ids] = noise
++        self.noise_steps_left[ids] = torch.where(renew, new_k.clamp(max=len(self.noise_repeat_cdf)), left) - 1
++        return torch.tanh(mean + std * noise)
++
++    @property
++    def output_std(self) -> torch.Tensor:
++        return self._std
++
++    def reset(self, dones: torch.Tensor | None = None, hidden_state=None) -> None:
++        pass
++
++    def as_jit(self) -> nn.Module:
++        """Return a version of the model compatible with Torch JIT export."""
++        return _TorchFlashSACActor(self)
++
++    def as_onnx(self, verbose: bool = False) -> nn.Module:
++        """Return a version of the model compatible with ONNX export."""
++        return _OnnxFlashSACActor(self, verbose)
++
++
++class FlashSACCriticModel(nn.Module):
++    """FlashSAC twin critic: two categorical (distributional) Q-networks evaluated as one ensemble."""
++
++    is_recurrent: bool = False
++
++    def __init__(
++        self,
++        obs: TensorDict,
++        obs_groups: dict[str, list[str]],
++        obs_set: str,
++        output_dim: int,
++        num_actions: int,
++        hidden_dim: int = 256,
++        num_blocks: int = 2,
++        num_bins: int = 101,
++        v_max: float = 5.0,
++        num_critics: int = 2,
++        **kwargs,
++    ) -> None:
++        """Initialize the critic.
++
++        Args:
++            obs: Observation dictionary.
++            obs_groups: Dictionary mapping observation sets to lists of observation groups.
++            obs_set: Observation set to use for this model (e.g., "critic").
++            output_dim: Unused; the value is categorical over ``num_bins`` atoms.
++            num_actions: Dimension of the action space (concatenated with observations).
++            hidden_dim: Width of the residual blocks.
++            num_blocks: Number of residual blocks.
++            num_bins: Number of value atoms, evenly spaced on [-v_max, v_max].
++            v_max: Value support bound, in units of the normalized reward.
++            num_critics: Ensemble size.
++        """
++        super().__init__()
++        self.obs_groups, self.obs_dim = _obs_dim(obs, obs_groups, obs_set)
++        self.v_max = v_max
++        self.encoder = _Encoder(num_critics, self.obs_dim + num_actions, hidden_dim, num_blocks)
++        self.head = _Linear(num_critics, hidden_dim, num_bins)
++        self.head_bias = nn.Parameter(torch.zeros(num_critics, num_bins))
++        self.register_buffer("bins", torch.linspace(-v_max, v_max, num_bins))
++        _normalize_parameters(self)
++
++    def get_latent(self, obs: TensorDict) -> torch.Tensor:
++        return torch.cat([obs[group] for group in self.obs_groups], dim=-1)
++
++    def forward(self, x: torch.Tensor, actions: torch.Tensor, training: bool) -> tuple[torch.Tensor, torch.Tensor]:
++        """Q-values [n, B] and atom log-probabilities [n, B, num_bins] for flat observations ``x`` of shape [B, D]."""
++        n = self.head_bias.shape[0]
++        h = torch.cat([x, actions], dim=-1).unsqueeze(0).expand(n, -1, -1)
++        logits = self.head(self.encoder(h, training)) + self.head_bias.unsqueeze(1)
++        log_probs = F.log_softmax(logits, dim=-1)
++        return (log_probs.exp() * self.bins).sum(dim=-1), log_probs
++
++
++class _TorchFlashSACActor(nn.Module):
++    """Exportable deterministic FlashSAC actor (running BatchNorm statistics, Tanh of the mean)."""
++
++    def __init__(self, model: FlashSACActorModel) -> None:
++        super().__init__()
++        self.encoder = copy.deepcopy(model.encoder)
++        self.head = copy.deepcopy(model.head)
++        self.head_bias = nn.Parameter(model.head_bias.detach().clone(), requires_grad=False)
++        self.output_dim = model.output_dim
++        self.input_size = model.obs_dim
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        out = self.head(self.encoder(x.unsqueeze(0), False))[0] + self.head_bias
++        return torch.tanh(out[..., : self.output_dim])
++
++    @torch.jit.export
++    def reset(self) -> None:
++        pass
++
++
++class _OnnxFlashSACActor(_TorchFlashSACActor):
++    """Exportable FlashSAC actor for ONNX."""
++
++    is_recurrent: bool = False
++
++    def __init__(self, model: FlashSACActorModel, verbose: bool) -> None:
++        super().__init__(model)
++        self.verbose = verbose
++
++    def get_dummy_inputs(self) -> tuple[torch.Tensor]:
++        return (torch.zeros(1, self.input_size),)
++
++    @property
++    def input_names(self) -> list[str]:
++        return ["obs"]
++
++    @property
++    def output_names(self) -> list[str]:
++        return ["actions"]
