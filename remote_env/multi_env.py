@@ -31,6 +31,8 @@ class MultiRemoteVecEnv(VecEnv):
         out = {"log": {k: sum(lg[k] for lg in logs if k in lg) / sum(1 for lg in logs if k in lg) for k in keys}}
         if all("time_outs" in e for e in extras):
             out["time_outs"] = torch.cat([e["time_outs"] for e in extras])
+        if all("time_outs_obs" in e for e in extras):
+            out["time_outs_obs"] = torch.cat([e["time_outs_obs"] for e in extras])
         return out
 
     @property

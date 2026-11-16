@@ -70,6 +70,11 @@ def serve(self, *a, **k):
             out["rew"], out["dones"] = rew, dones
             if "time_outs" in extras:
                 out["time_outs"] = extras["time_outs"]
+            if env.unwrapped.cfg.compute_final_obs:
+                out["final_idx"] = extras["time_outs"].nonzero().squeeze(-1)
+                if "time_outs_obs" in extras:
+                    for k, v in extras["time_outs_obs"].items():
+                        out[f"final/{k}"] = v[out["final_idx"]]
             return wire.pack(out, {"log": scalar_logs(extras)})
         if method == "SetEpisodeLen":
             env.episode_length_buf = ts["episode_length_buf"].to(env.device)

@@ -74,7 +74,15 @@ class RemoteVecEnv(VecEnv):
         extras = {"log": meta.get("log", {})}
         if "time_outs" in ts:
             extras["time_outs"] = ts["time_outs"]
-        return self._obs(ts), ts["rew"], ts["dones"], extras
+        obs = self._obs(ts)
+        if "final_idx" in ts:
+            idx = ts["final_idx"]
+            final = obs.clone() if len(idx) else obs
+            if len(idx):
+                for k in final.keys():
+                    final[k][idx] = ts[f"final/{k}"]
+            extras["time_outs_obs"] = final
+        return obs, ts["rew"], ts["dones"], extras
 
     def close(self):
         with contextlib.suppress(grpc.RpcError):

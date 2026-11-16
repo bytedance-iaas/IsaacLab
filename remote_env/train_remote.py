@@ -24,6 +24,12 @@ p.add_argument("--target", required=True, help="host:port[,host:port...]")
 p.add_argument(
     "--async_collect", type=int, default=1, help="1: with more than one shard, shards step without a per-step barrier"
 )
+p.add_argument(
+    "--interleave",
+    type=int,
+    default=0,
+    help="SAC only, 1: spread each iteration's gradient steps over its environment steps (sac_overlap.py)",
+)
 p.add_argument("--authority", default=None)
 p.add_argument("--iters", type=int, default=1500)
 p.add_argument("--seed", type=int, default=42)
@@ -49,6 +55,7 @@ import types
 
 import async_runner
 import rsl_rl.runners
+import sac_overlap
 from multi_env import MultiRemoteVecEnv
 
 torch.manual_seed(args.seed)
@@ -62,7 +69,9 @@ log_dir = os.path.join(
     "logs", "rsl_rl", agent_cfg.experiment_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.run_name
 )
 runner = getattr(rsl_rl.runners, agent_cfg.class_name)(env, agent_cfg.to_dict(), log_dir=log_dir, device=args.device)
-if args.async_collect and len(env.shards) > 1:
+if args.interleave and hasattr(runner.alg, "replay_buffer"):
+    runner.learn = types.MethodType(sac_overlap.learn_interleaved, runner)
+elif args.async_collect and len(env.shards) > 1:
     runner.learn = types.MethodType(async_runner.learn, runner)
 start_it = 0
 if args.resume:
