@@ -3,6 +3,7 @@ entrypoint's runner setup. --target takes one address or a comma-separated list 
 servers on this host)."""
 
 import argparse
+import functools
 import importlib.metadata as metadata
 import os
 import sys
@@ -27,11 +28,13 @@ p.add_argument(
     "--async_collect", type=int, default=1, help="1: with more than one shard, shards step without a per-step barrier"
 )
 p.add_argument(
-    "--interleave",
-    type=int,
-    default=0,
-    help="SAC only, 1: spread each iteration's gradient steps over its environment steps (sac_overlap.py)",
+    "--mode",
+    choices=["serial", "overlap"],
+    default="serial",
+    help="serial: collect, then update (PPO, SAC, FlashSAC); overlap: update while collecting (PPO: the previous "
+    "rollout's update, async_runner.learn_overlap; SAC: each step's share of the gradient steps, sac_overlap.py)",
 )
+p.add_argument("--behav_w_max", type=float, default=2.0, help="PPO overlap: drop samples with pi_prox/pi_behav above")
 p.add_argument("--authority", default=None)
 p.add_argument("--iters", type=int, default=1500)
 p.add_argument("--seed", type=int, default=42)
@@ -71,8 +74,16 @@ log_dir = os.path.join(
     "logs", "rsl_rl", agent_cfg.experiment_name, datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + "_" + args.run_name
 )
 runner = getattr(rsl_rl.runners, agent_cfg.class_name)(env, agent_cfg.to_dict(), log_dir=log_dir, device=args.device)
-if args.interleave and hasattr(runner.alg, "replay_buffer"):
-    runner.learn = types.MethodType(sac_overlap.learn_interleaved, runner)
+if args.mode == "overlap":
+    alg_name = type(runner.alg).__name__
+    if alg_name == "SAC":
+        runner.learn = types.MethodType(sac_overlap.learn_interleaved, runner)
+    elif alg_name == "PPO":
+        runner.learn = types.MethodType(
+            functools.partial(async_runner.learn_overlap, behav_w_max=args.behav_w_max), runner
+        )
+    else:
+        sys.exit(f"--mode overlap supports PPO and SAC, not {alg_name}")
 elif args.async_collect and len(env.shards) > 1:
     runner.learn = types.MethodType(async_runner.learn, runner)
 start_it = 0

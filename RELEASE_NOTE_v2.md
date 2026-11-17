@@ -97,12 +97,16 @@ PPO 用 4096 个环境、1500 次迭代；SAC 用 8192 个环境、800 次迭代
 
 - 基于 rsl-rl-lib 5.4.1 的补丁（`sac_port/apply.sh`），加入 SAC 算法、actor/critic 模型、经验回放缓冲区和 `OffPolicyRunner`
 - G1 平地与粗糙地形自带 SAC 任务配置（`rsl_rl_sac_cfg_entry_point`）
+- FlashSAC 补丁叠在 SAC 补丁之上（`apply.sh` 依次打两个），G1 平地与粗糙地形配置为 `rsl_rl_flashsac_cfg_entry_point`
 - 三种部署形态都可用
 
 ## 命令行
 
 `remote_env/serve_shards.sh` 纯 NPU 起 CPU 仿真进程 · `remote_env/serve_persist.sh` 异构起常驻仿真服务 ·
-`remote_env/train_remote.py` 连接仿真地址训练（`--agent` 选 PPO / SAC，`--device` 选 NPU / GPU，`--resume` 续训）。
+`remote_env/train_remote.py` 连接仿真地址训练（`--agent` 选 PPO / SAC / FlashSAC，`--device` 选 NPU / GPU，`--resume` 续训）。
+`--mode` 选学习循环：`serial`（默认）先采集再更新，PPO / SAC / FlashSAC 都可用；`overlap` 在采集的同时做更新，只支持 PPO 和 SAC。
+- 重叠 PPO：采第 k 轮时后台做第 k−1 轮的更新，采集用的策略落后一次更新，用解耦 PPO 损失（RLinf 异步 PPO 的做法）按行为策略权重修正，`--behav_w_max` 是丢弃样本的权重上限
+- 重叠 SAC：每轮的梯度更新均摊到每一步仿真里做，每步的经验一到就入库并做这一步的份额，每轮更新次数和超参不变，采集用的策略约落后 1 次 actor 更新
 所有仿真端与学习端之间的调用都要求同一个 `ENV_TOKEN`。
 
 ## 已知限制
